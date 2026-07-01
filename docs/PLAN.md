@@ -1,0 +1,340 @@
+# Plan: `ko` v0.0.1
+
+> Spec 冻结日期：2026-07-01
+> 目标：交付 v0.0.1 首个可用版（详见 `docs/SPEC.md` §8）
+
+---
+
+## 1. 架构总览
+
+```
+                      ┌─────────────────────────────┐
+                      │     ko (single binary)      │
+                      │                             │
+   ┌────────┐         │  ┌──────────┐  ┌────────┐  │
+   │  Web   │◀──HTTP─▶│  │ Dashboard│  │  CLI   │  │
+   │Browser │   WS    │  │ (REST+WS)│  │ (cobra)│  │
+   └────────┘         │  └────┬─────┘  └───┬────┘  │
+                      │       │            │        │
+                      │  ┌────▼────────────▼────┐   │
+                      │  │  internal/cluster/   │   │   集群编排
+                      │  │  - config / executor │   │   kubeadm 包装
+                      │  │  - kubeadm / certs   │   │   节点生命周期
+                      │  │  - teardown / journald│  │
+                      │  └────────┬─────────────┘   │
+                      │           │                 │
+                      │  ┌────────▼──────┐ ┌───────┴────┐
+                      │  │ internal/     │ │ internal/  │
+                      │  │ containerd    │ │ docker     │   运行时
+                      │  │ + docker      │ │ (optional) │
+                      │  └────────┬──────┘ └─────┬──────┘
+                      │           │              │
+                      │  ┌────────▼──────────────▼──────┐
+                      │  │     internal/helm/           │   Helm SDK
+                      │  │     (cilium / kube-vip /     │
+                      │  │      flannel)                │
+                      │  └────────┬─────────────────────┘
+                      │           │                       │
+                      │  ┌────────▼──────────┐ ┌─────────┴────┐
+                      │  │ internal/tune/    │ │ internal/    │
+                      │  │ (sysctl/modules/  │ │ image/       │   离线大镜像包
+                      │  │  swap/systemd)    │ │ (OCI build)  │
+                      │  └───────────────────┘ └──────────────┘
+                      └─────────────────────────────┘
+                                  │ SSH
+                  ┌───────────────┼───────────────┐
+                  ▼               ▼               ▼
+            ┌──────────┐   ┌──────────┐   ┌──────────┐
+            │ master-1 │   │ master-2 │   │ worker-1 │   Linux 节点
+            │(control  │   │(control  │   │(kubelet) │   containerd
+            │ plane)   │   │ plane)   │   │          │   + kube-vip
+            └──────────┘   └──────────┘   └──────────┘
+```
+
+---
+
+## 2. 组件依赖图
+
+```
+[executor] ─────────────────────────────────────────────┐
+   │                                                    │
+   ▼                                                    │
+[config 解析] ──▶ [cluster 类型] ◀── [cluster.hcl]      │
+                       │                                │
+                       ▼                                │
+                [kubeadm 包装] ◀────────────────────── [tune]
+                       │                                │
+                       ▼                                │
+                [containerd 安装]                       │
+                [docker 安装]                           │
+                       │                                │
+                       ▼                                │
+                [helm 装 cilium / kube-vip / flannel]    │
+                       │                                │
+                       ▼                                │
+                [node lifecycle]                        │
+                       │                                │
+                       ▼                                ▼
+                [teardown] ─────▶ [doctor]          [dashboard API]
+                       │                                │
+                       ▼                                ▼
+                  [journald] ─────────────────▶ [WS progress/logs]
+                       │
+                       ▼
+                 [image/OCI builder] ◀── [ko pack]
+                       │
+                       ▼
+                 [e2e tests]
+```
+
+**关键依赖**：
+
+- executor 是地基，所有远程操作依赖它
+- config 解析在所有命令之前
+- dashboard 可以早期用 mock 数据并行开发
+- 离线 pack 在所有功能稳定后做
+
+---
+
+## 3. 垂直切片（Vertical Slices）
+
+按可交付顺序，不是按层堆。每条切片 = 一个可演示的能力。
+
+### Slice 1：地基（5 天）
+
+**目标**：`ko version` / `ko arch` / `ko doctor`（基础部分）能跑，SSH 通
+
+| Task | 文件 | Verify |
+|---|---|---|
+| 1.1 仓库骨架 + go.mod + Makefile | `cmd/ko/main.go`, `Makefile`, `go.mod` | `make build` 出 `bin/ko` |
+| 1.2 cobra CLI 框架 | `internal/cli/root.go`, `version.go`, `arch.go` | `ko --help`, `ko version` |
+| 1.3 slog 日志 | `internal/logger/logger.go` | 输出带 level / 时间戳 |
+| 1.4 HCL 配置解析 | `pkg/config/config.go`, `internal/cluster/config.go` | `ko doctor --config` 解析不报错 |
+| 1.5 executor 抽象 + local + mock | `internal/cluster/executor.go`, `local_exec.go`, `mock_exec.go` | 单元测试 100% |
+| 1.6 executor SSH | `internal/cluster/ssh_exec.go` | 连真实机器跑 `uname -a` |
+| 1.7 doctor 基础（SSH/OS/磁盘） | `internal/cli/doctor.go` | `ko doctor` 输出 4 项检查 |
+
+### Slice 2：单机 init（7 天）
+
+**目标**：`ko init` 在 1 master + 0 worker 上能完成
+
+| Task | 文件 | Verify |
+|---|---|---|
+| 2.1 upstream containerd 安装 | `internal/containerd/install.go` | 节点上 `containerd --version` 是 v2.x |
+| 2.2 containerd systemd unit + config.toml 写入 | `internal/containerd/config.go` | `systemctl status containerd` active |
+| 2.3 docker 安装（在线 + 离线 deb） | `internal/docker/install.go`, `daemon.go` | e2e 切 docker 跑通 |
+| 2.4 registry mirror 写入（containerd + docker） | `internal/containerd/config.go`, `internal/docker/daemon.go` | `ctr info` 看到 mirror |
+| 2.5 kubeadm init 包装 | `internal/cluster/kubeadm.go` | 1 节点 init 成功，apiserver up |
+| 2.6 kube-vip（单节点模式） | `internal/cluster/kube_vip.go` | VIP 可达，apiserver 健康 |
+| 2.7 Helm 装 Cilium（kube-proxy 替换） | `internal/helm/install.go`, `internal/cluster/cilium.go`, `cilium_kpfree.go` | `cilium status` strict，节点 Ready |
+| 2.8 `ko init` 命令 | `internal/cli/init.go` | 单 master e2e 全绿 |
+| 2.9 端到端 e2e：单 master | `test/e2e/single_master_test.go` | case 1 全绿 |
+
+### Slice 3：HA + 多 master（5 天）
+
+**目标**：`ko init` 在 3 master HA 拓扑上完成
+
+| Task | 文件 | Verify |
+|---|---|---|
+| 3.1 stacked etcd 拓扑配置 | `internal/cluster/kubeadm.go` | `kubectl get nodes` 看到 3 master |
+| 3.2 kube-vip HA（DaemonSet 模式） | `internal/cluster/kube_vip.go` | 杀一个 master，VIP 仍可达 |
+| 3.3 cert 分发（**100 年有效期**） | `internal/cluster/certs.go` | 第二个 master join 成功；`ko cluster certs` 显示剩余 ~100y |
+| 3.4 端到端 e2e：HA 3 master | `test/e2e/ha_stacked_test.go` | case 2 全绿 |
+| 3.5 端到端 e2e：Flannel 兜底（某节点 cni=flannel） | `test/e2e/flannel_fallback_test.go` | case 11 全绿 |
+
+### Slice 4：节点生命周期（5 天）
+
+**目标**：`ko node add/remove` 在运行中集群上工作
+
+| Task | 文件 | Verify |
+|---|---|---|
+| 4.1 node add worker | `internal/cluster/node_lifecycle.go` | 新节点 Ready，耗时 < 2min |
+| 4.2 node add master（带 cert 签发） | 同上 | 新 master Ready，etcd 成员 +1 |
+| 4.3 node remove（drain → delete → reset） | 同上 | 节点从集群消失，本地 kubelet 清理 |
+| 4.4 node list / label | `internal/cli/node.go` | 列表正确，label 生效 |
+| 4.5 端到端 e2e：add/remove 5 worker | `test/e2e/node_lifecycle_test.go` | case 3 全绿 |
+
+### Slice 5：主机调优（3 天）
+
+**目标**：`ko tune apply/show/reset`
+
+| Task | 文件 | Verify |
+|---|---|---|
+| 5.1 sysctl 读写 | `internal/tune/sysctl.go` | `sysctl net.ipv4.ip_forward` = 1 |
+| 5.2 内核模块 | `internal/tune/modules.go` | `lsmod \| grep br_netfilter` 有 |
+| 5.3 swap / systemd / 磁盘 | `internal/tune/{swap,systemd,disk}.go` | 各项检查 OK |
+| 5.4 profiles（production/dev/minimal） | `internal/tune/profiles.go` | 切 profile 后 sysctl 变化正确 |
+| 5.5 `ko tune apply/show/reset` 命令 | `internal/cli/tune.go` | 端到端 e2e：case 5 |
+
+### Slice 6：集群释放 / 杂项（3 天）
+
+**目标**：`ko reset` 干净回滚 + `ko cluster info/certs/backup` + completion
+
+| Task | 文件 | Verify |
+|---|---|---|
+| 6.1 `ko reset` 流程 | `internal/cluster/teardown.go`, `internal/cli/reset.go` | 3 次 init 不出脏数据 |
+| 6.2 `ko cluster info / certs` | `internal/cli/cluster.go` | 信息正确，证书到期时间列出 |
+| 6.3 `ko cluster backup`（etcd snapshot，stacked only） | 同上 | 恢复后集群正常 |
+| 6.4 `ko completion` | `internal/cli/completion.go` | bash/zsh/fish 都能 source |
+| 6.5 端到端 e2e：reset + 重复 init | `test/e2e/reset_test.go` | case 13 全绿 |
+
+### Slice 7：离线大镜像包（7 天）
+
+**目标**：`ko pack` 出 OCI image，`ko init --offline` 跑通
+
+| Task | 文件 | Verify |
+|---|---|---|
+| 7.1 OCI image builder | `internal/image/builder.go` | 输出 tar.gz 用 `crane manifest` 可看 |
+| 7.2 manifest list（per arch） | `internal/image/manifest_list.go` | amd64 + arm64 两个子清单 |
+| 7.3 upstream containerd 下载（GitHub release） | `internal/image/upstream.go` | 下载到 `vendor/_cache/containerd-<v>-linux-<arch>.tar.gz` |
+| 7.4 docker deb/rpm 预下载 | `internal/image/docker_pkgs.go` | OS-detect 拉对应包 |
+| 7.5 helm chart 打包（cilium / kube-vip / flannel） | `internal/helm/pull.go` | tgz 在 `vendor/helm/` 下 |
+| 7.6 k8s 镜像 ctr pull → tar | `internal/image/k8s_images.go` | 包内含 k8s 镜像 |
+| 7.7 `ko pack / pack push / pack inspect` | `internal/cli/pack.go` | 三条命令可用 |
+| 7.8 runtime 离线加载（ctr import） | `internal/image/puller.go` | `ko init --offline` 成功 |
+| 7.9 端到端 e2e：离线（断网容器） | `test/e2e/offline_test.go` | case 6 全绿 |
+
+### Slice 8：Doctor 完整化（2 天）
+
+**目标**：`ko doctor` 全绿
+
+| Task | 文件 | Verify |
+|---|---|---|
+| 8.1 eBPF 内核检测 | `internal/doctor/ebpf.go` | 不支持时警告 + 建议 flannel |
+| 8.2 containerd 状态检查 | `internal/doctor/containerd.go` | running / version 报告 |
+| 8.3 docker 状态检查 | `internal/doctor/docker.go` | running / version 报告 |
+| 8.4 网络/磁盘/端口检查 | `internal/doctor/{net,disk,ports}.go` | VIP/6443/2379/2380 等 |
+| 8.5 `ko doctor` 命令（已完成基础，补全） | `internal/cli/doctor.go` | 所有检查项报告 |
+
+### Slice 9：Dashboard（10 天）
+
+**目标**：`ko dashboard` 启动后能完成 install / node add / tune / release
+
+| Task | 文件 | Verify |
+|---|---|---|
+| 9.1 HTTP server + basic auth middleware | `internal/dashboard/server.go`, `auth.go` | 未授权 401，basic auth 通过 |
+| 9.2 REST API：cluster | `internal/dashboard/api/cluster.go` | 启动/状态/reset 端点 |
+| 9.3 REST API：node | `internal/dashboard/api/node.go` | list/add/remove |
+| 9.4 REST API：tune | `internal/dashboard/api/tune.go` | apply/show |
+| 9.5 REST API：logs (历史) | `internal/dashboard/api/logs.go` | journalctl 查询接口 |
+| 9.6 WebSocket：progress | `internal/dashboard/ws/progress.go` | 任务进度实时 |
+| 9.7 WebSocket：logs (实时 tail) | `internal/dashboard/ws/logs.go` | journalctl -f |
+| 9.8 前端：Vite + React + TS 骨架 | `web/` | `make web-dev` 起 dev server |
+| 9.9 前端：Install 页面 | `web/src/pages/Install/` | 集群初始化表单 |
+| 9.10 前端：Nodes 页面 | `web/src/pages/Nodes/` | 节点增删 |
+| 9.11 前端：Tune 页面 | `web/src/pages/Tune/` | 调优 apply |
+| 9.12 前端：Logs 页面 | `web/src/pages/Logs/` | 实时 + 历史 |
+| 9.13 前端：Release 页面 | `web/src/pages/Release/` | 集群释放确认 |
+| 9.14 前端：Settings 页面 | `web/src/pages/Settings/` | 集群信息 / 证书到期 |
+| 9.15 embed.FS 把前端塞进 Go 进程 | `internal/dashboard/static/` | 单二进制无外部资源 |
+| 9.16 端到端 e2e：Dashboard 鉴权 + 主流程 | `test/e2e/dashboard_test.go` | case 12 全绿 |
+
+### Slice 10：多架构 arm64（3 天）
+
+**目标**：amd64 + arm64 双架构 e2e 通过
+
+| Task | 文件 | Verify |
+|---|---|---|
+| 10.1 Makefile 加 `amd64 / arm64` 编译目标 | `Makefile` | `make build-arch` 出两版二进制 |
+| 10.2 CI 矩阵：qemu-aarch64 e2e | `.github/workflows/ci.yml` | arm64 模拟器跑核心 e2e |
+| 10.3 端到端 e2e：arm64（qemu） | `test/e2e/arm64_test.go` | case 7 arm64 部分全绿 |
+| 10.4 文档：arm64 smoke 测试清单 | `docs/RUNBOOK.md` | 物理机 smoke 步骤 |
+
+### Slice 11：发布 / 文档（3 天）
+
+**目标**：v0.0.1 release 可发
+
+| Task | 文件 | Verify |
+|---|---|---|
+| 11.1 README 完整（quick start） | `README.md` | 新人 5min 跑通 |
+| 11.2 RUNBOOK 运维手册 | `docs/RUNBOOK.md` | 升级 / 备份 / 故障排查 |
+| 11.3 CHANGELOG | `docs/CHANGELOG.md` | v0.0.1 条目 |
+| 11.4 GitHub Actions：lint + test + e2e + release | `.github/workflows/*.yml` | push 自动跑 |
+| 11.5 `ko pack` GitHub Action（release 流水线） | `.github/workflows/release.yml` | tag 触发自动 pack + push |
+
+---
+
+## 4. 总时间线
+
+| 切片 | 周 | 主要风险 |
+|---|---|---|
+| S1 地基 | W1 | executor SSH 兼容性 |
+| S2 单机 init | W2-W3 | upstream containerd 安装路径 / Cilium 兼容 |
+| S3 HA | W3-W4 | cert 分发 / etcd 集群一致性 |
+| S4 节点生命周期 | W4-W5 | drain 边界 / master 移除的回滚 |
+| S5 tune | W5 | 不同 OS 的 sysctl 差异 |
+| S6 reset + 杂项 | W5-W6 | teardown 残留清理 |
+| S7 离线包 | W6-W7 | OCI builder 复杂度 / 体积控制 |
+| S8 doctor | W7 | eBPF 检测跨内核版本 |
+| S9 dashboard | W7-W9 | WS 鉴权 / 前端集成 |
+| S10 arm64 | W9 | qemu-aarch64 性能 / arm 内核差异 |
+| S11 release | W9-W10 | 文档 / CI 跑通 |
+
+**关键路径**：S1 → S2 → S3 → S7 → S9 → S11
+
+---
+
+## 5. 风险与缓解
+
+| 风险 | 影响 | 缓解 |
+|---|---|---|
+| containerd 2.x 上游 API / 配置破坏 | 切片 S2、S7 | 钉死 minor 版本（v0.0.1 用 v2.0.x），CI 每日跑 upstream 监测 |
+| K8s 1.35/1.36 客户端 API 变化 | 全局 | 用 `k8s.io/client-go` 对应版本，先在 S1 拉好依赖 |
+| Cilium kube-proxy 替换 在某些 arm64 内核不可用 | 切片 S3、S10 | 节点级 `cni = "flannel"` 兜底；doctor 检测并告警 |
+| Helm SDK + 离线 chart 复杂度 | 切片 S7 | 早期在 S1/S2 用 `helm template` 而非 `helm install`，后期再升级到 install |
+| 离线大镜像包体积膨胀 | 切片 S7 | 分层打包（k8s 镜像 base + ko overlay），分 tag 复用；每层算 sha256 |
+| WebSocket basic auth 在浏览器端的怪行为 | 切片 S9 | 第一次连接时浏览器带 Authorization header，握手后服务端校验 |
+| arm64 qemu 模拟器慢 | 切片 S10 | CI 用并行 + 仅跑核心 case（init + add worker） |
+| 用户魔改 containerd 切换（v0.1.x） | 未来 | v0.0.1 走 upstream，把 `source` 字段、vendor/ 目录预留好，切换成本低 |
+
+---
+
+## 6. 并行机会
+
+| 切片 | 可并行的工作 |
+|---|---|
+| S1 | 没人能并行（地基） |
+| S2 | 9.8-9.9（前端骨架 + Install mock）可与 S2 后半段并行 |
+| S3 | S4 节点移除的 drain 逻辑可先并行设计 |
+| S4 | 9.10-9.14（其他前端页面）可并行 |
+| S5 | 独立，8.x（doctor 各项）可并行 |
+| S6 | 独立 |
+| S7 | 大头在 image 模块；其他人继续 e2e / doc |
+| S9 | 前端 / 后端可严格并行（先定 API 契约） |
+| S10 | arm64 物理机 smoke 由用户/团队单独跑，CI 不卡 |
+
+---
+
+## 7. 验证检查点（Phase 间门）
+
+每条切片完成 = 一个 checkpoint：
+
+- [ ] S1 完：`ko version` / `ko arch` / `ko doctor`（基础）能跑，SSH 通
+- [ ] S2 完：1 节点集群能起来，`kubectl get nodes` Ready
+- [ ] S3 完：3 master HA 集群，VIP 切主后 apiserver 仍可达
+- [ ] S4 完：add/remove worker 跑通，add master 跑通
+- [ ] S5 完：tune apply 后关键 sysctl 生效
+- [ ] S6 完：reset 干净回滚 3 次不出问题
+- [ ] S7 完：离线环境 `ko init --offline` 成功
+- [ ] S8 完：doctor 全绿
+- [ ] S9 完：Dashboard 完成 install/node/tune/release/logs 主流程
+- [ ] S10 完：amd64 + arm64 e2e 都过
+- [ ] S11 完：v0.0.1 release tag 推送，CI release 流水线跑通
+
+**v0.0.1 发布门**：S1–S11 全过 + SPEC §8 全部勾选。
+
+---
+
+## 8. Phase 3 — 任务拆分
+
+见 `docs/TASKS.md`（待生成），每条任务单 session 可完成，带 acceptance + verify。
+
+---
+
+## 9. Phase 4 — 实施原则
+
+- 每个 slice 完成后跑对应 e2e 再进入下一个
+- 任何 HCL schema 字段变化先更新 SPEC.md 再改代码
+- 任何 `internal/` 包的结构变化先在本 PLAN 标注
+- e2e 失败 = 阻塞，不允许"等下个 slice 修"
+- arm64 / amd64 CI 矩阵都绿才能进 release

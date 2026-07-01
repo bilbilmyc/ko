@@ -1,0 +1,42 @@
+# Build output
+bin/
+dist/
+
+# Go
+*.test
+*.out
+coverage.out
+coverage.html
+vendor/_cache/
+
+# Vendored binaries (user-provided, see SPEC §4)
+# Tracked via git for amd64/arm64 when user provides them; _cache is ignored.
+vendor/_cache/
+
+# Frontend
+web/node_modules/
+web/dist/
+web/.vite/
+
+# Local
+.env
+.env.local
+*.local
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# SSH / credentials
+*.pem
+*.key
+id_rsa*
+
+# ko runtime data (when running ko init locally for testing)
+.kube/
+.kubectl-cache/
