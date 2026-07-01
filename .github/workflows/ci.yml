@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Lint + unit tests on the native amd64 runner. Fast feedback loop —
+  # runs first and gates the slower cross-arch job below.
+  test-amd64:
+    name: test (linux/amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race -timeout 5m ./...
+
+  # Cross-compile arm64 + smoke-test it under qemu-binfmt. Catches arch-
+  # specific bugs (alignment, byte order, syscall availability) without
+  # requiring real aarch64 hardware in CI.
+  test-arm64:
+    name: test (linux/arm64, qemu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: install qemu + binfmt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+          sudo update-binfmts --enable qemu-aarch64
+
+      - name: go test (cross)
+        env:
+          GOARCH: arm64
+        run: go test -short -timeout 5m ./...
+
+      - name: cross-build smoke test
+        env:
+          GOARCH: arm64
+          GOOS: linux
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p bin
+          go build -ldflags '-s -w' -o bin/ko-linux-arm64 ./cmd/ko
+          # `ko version` should print successfully when run under qemu.
+          file bin/ko-linux-arm64
+          qemu-aarch64-static bin/ko-linux-arm64 version

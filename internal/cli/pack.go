@@ -34,7 +34,16 @@ func newPackBuildCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "build",
-		Short: "Build an offline OCI bundle for the given arch",
+		Short: "Build an offline OCI bundle (single-arch or multi-arch)",
+		Long: `build fetches vendor artifacts (containerd tarball, helm charts, k8s
+images) and packs them into a sealos-style OCI image-layout tar.gz.
+
+  --arch amd64    Single-arch bundle (default)
+  --arch arm64    Single-arch bundle
+  --arch all      Multi-arch image index (amd64 + arm64 in one tar.gz)
+
+Multi-arch dedups identical layer blobs across arches. The output filename
+embeds the arch (single-arch) or ends in -multi.oci.tar.gz (multi-arch).`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if arch == "" {
 				arch = "amd64"
@@ -46,49 +55,92 @@ func newPackBuildCmd() *cobra.Command {
 				version = "v0.0.1"
 			}
 			cacheDir := filepath.Join(homeDir(), ".ko", "cache")
-			dl := image.NewUpstream(cacheDir)
 
-			layers := []image.LayerSource{}
-			ctd, err := dl.Containerd(cmd.Context(), "v2.0.5", arch)
-			if err != nil {
-				logger.Warn("containerd download failed (skipping)", "err", err)
-			} else {
-				layers = append(layers, image.LayerSource{
-					SrcPath: ctd, MediaType: image.MediaTypeKoContainerdTar,
-				})
+			if arch == "all" {
+				return buildMultiArch(cmd, cacheDir, outputDir, version)
 			}
-			chartDir := filepath.Join(cacheDir, "helm")
-			if charts, err := image.HelmPullDefault(cmd.Context(), "", "1.16.1", chartDir); err != nil {
-				logger.Warn("helm pull failed (skipping)", "err", err)
-			} else {
-				for name, p := range charts {
-					_ = name
-					layers = append(layers, image.LayerSource{
-						SrcPath: p, MediaType: image.MediaTypeKoHelmChart,
-					})
-				}
-			}
-
-			if len(layers) == 0 {
-				return fmt.Errorf("no layers produced — check connectivity and try again")
-			}
-			out, descs, err := image.Build(image.BuildOpts{
-				Arch: arch, Version: version, Layers: layers, OutputDir: outputDir,
-			})
-			if err != nil {
-				return err
-			}
-			cmd.Printf("✓ bundle: %s\n", out)
-			for _, d := range descs {
-				cmd.Printf("  layer: %s (%d bytes)\n", d.Digest, d.Size)
-			}
-			return nil
+			return buildSingleArch(cmd, cacheDir, arch, outputDir, version)
 		},
 	}
-	cmd.Flags().StringVar(&arch, "arch", "amd64", "target architecture: amd64 | arm64")
+	cmd.Flags().StringVar(&arch, "arch", "amd64", "target architecture: amd64 | arm64 | all")
 	cmd.Flags().StringVar(&outputDir, "output", "", "output directory (default ~/.ko/bundles)")
 	cmd.Flags().StringVar(&version, "version", "v0.0.1", "ko version tag")
 	return cmd
+}
+
+func buildSingleArch(cmd *cobra.Command, cacheDir, arch, outputDir, version string) error {
+	dl := image.NewUpstream(cacheDir)
+	layers, err := gatherLayers(cmd, dl, cacheDir, arch)
+	if err != nil {
+		return err
+	}
+	if len(layers) == 0 {
+		return fmt.Errorf("no layers produced — check connectivity and try again")
+	}
+	out, descs, err := image.Build(image.BuildOpts{
+		Arch: arch, Version: version, Layers: layers, OutputDir: outputDir,
+	})
+	if err != nil {
+		return err
+	}
+	cmd.Printf("✓ bundle: %s\n", out)
+	for _, d := range descs {
+		cmd.Printf("  layer: %s (%d bytes)\n", d.Digest, d.Size)
+	}
+	return nil
+}
+
+func buildMultiArch(cmd *cobra.Command, cacheDir, outputDir, version string) error {
+	dl := image.NewUpstream(cacheDir)
+	images := make([]image.ArchImage, 0, 2)
+	for _, arch := range []string{"amd64", "arm64"} {
+		layers, err := gatherLayers(cmd, dl, cacheDir, arch)
+		if err != nil {
+			return err
+		}
+		if len(layers) == 0 {
+			return fmt.Errorf("arch %s: no layers produced", arch)
+		}
+		images = append(images, image.ArchImage{Arch: arch, Layers: layers})
+	}
+	res, err := image.BuildMulti(image.MultiBuildOpts{
+		Version: version, OutputDir: outputDir, Images: images,
+	})
+	if err != nil {
+		return err
+	}
+	cmd.Printf("✓ multi-arch bundle: %s\n", res.OutputPath)
+	for _, m := range res.Manifests {
+		cmd.Printf("  manifest: %s  %s/%s  (%d bytes)\n",
+			m.Digest, m.Platform.OS, m.Platform.Architecture, m.Size)
+	}
+	return nil
+}
+
+// gatherLayers fetches containerd + helm charts for a single arch. Errors
+// fetching a single source are downgraded to warnings so a flaky network
+// doesn't block the whole pack; the caller validates len(layers) > 0.
+func gatherLayers(cmd *cobra.Command, dl *image.UpstreamDownloader, cacheDir, arch string) ([]image.LayerSource, error) {
+	layers := []image.LayerSource{}
+	ctd, err := dl.Containerd(cmd.Context(), "v2.0.5", arch)
+	if err != nil {
+		logger.Warn("containerd download failed (skipping)", "arch", arch, "err", err)
+	} else {
+		layers = append(layers, image.LayerSource{
+			SrcPath: ctd, MediaType: image.MediaTypeKoContainerdTar,
+		})
+	}
+	chartDir := filepath.Join(cacheDir, "helm")
+	if charts, err := image.HelmPullDefault(cmd.Context(), "", "1.16.1", chartDir); err != nil {
+		logger.Warn("helm pull failed (skipping)", "arch", arch, "err", err)
+	} else {
+		for _, p := range charts {
+			layers = append(layers, image.LayerSource{
+				SrcPath: p, MediaType: image.MediaTypeKoHelmChart,
+			})
+		}
+	}
+	return layers, nil
 }
 
 func newPackInspectCmd() *cobra.Command {
@@ -160,7 +212,6 @@ func inspectBundle(w io.Writer, path string) error {
 			continue
 		}
 		fmt.Fprintln(w, "      layers:")
-		// Stable order for readability.
 		ls := append([]image.LayerDescriptor(nil), mf.Layers...)
 		sort.Slice(ls, func(i, j int) bool { return ls[i].MediaType < ls[j].MediaType })
 		for _, l := range ls {
