@@ -20,19 +20,20 @@ import (
 
 // KubeadmOptions configures a kubeadm init/join.
 type KubeadmOptions struct {
-	KubernetesVersion string // e.g. "1.35.0"
-	ControlPlane      bool   // true for master
-	APIServerEndpoint string // e.g. "10.0.0.100:6443" (for HA)
-	Token             string
+	KubernetesVersion   string // e.g. "1.35.0"
+	ControlPlane        bool   // true for master
+	APIServerEndpoint   string // e.g. "10.0.0.100:6443" (for HA)
+	Token               string
 	DiscoveryTokenCAHash string
-	CertKey           string // for upload-certs on HA masters
-	PodCIDR           string
-	ServiceCIDR       string
-	NodeName          string
-	SkipPhases        []string // e.g. ["addon/kube-proxy"]
-	ExtraArgs         []string // appended to kubeadm init/join
-	NodeIP            string
-	ImageRepository   string
+	CertKey             string // for upload-certs on HA masters
+	PodCIDR             string
+	ServiceCIDR         string
+	NodeName            string
+	SkipPhases          []string // e.g. ["addon/kube-proxy"]
+	ExtraArgs           []string // appended to kubeadm init/join
+	NodeIP              string
+	ImageRepository     string
+	CertificateValidity string // e.g. "876000h" — 100-year certs (S3 requirement)
 }
 
 type Kubeadm struct {
@@ -57,6 +58,9 @@ func (k *Kubeadm) Init(ctx context.Context, host string, opts KubeadmOptions) (R
 		"--upload-certs",
 		"--skip-token-print",
 	}
+	if opts.CertificateValidity != "" {
+		args = append(args, "--certificate-validity="+opts.CertificateValidity)
+	}
 	if opts.ImageRepository != "" {
 		args = append(args, "--image-repository="+opts.ImageRepository)
 	}
@@ -79,7 +83,9 @@ func (k *Kubeadm) Init(ctx context.Context, host string, opts KubeadmOptions) (R
 	return res, nil
 }
 
-// Join runs `kubeadm join` on a worker/master node.
+// Join runs `kubeadm join` on a worker/master node. For HA master joins the
+// caller must set opts.ControlPlane=true (and supply Token/CertKey/CAHash);
+// JoinControlPlane is a convenience wrapper that calls Join with ControlPlane=true.
 func (k *Kubeadm) Join(ctx context.Context, host string, opts KubeadmOptions) (Result, error) {
 	args := []string{
 		"kubeadm join",
@@ -87,8 +93,15 @@ func (k *Kubeadm) Join(ctx context.Context, host string, opts KubeadmOptions) (R
 		"--discovery-token-ca-cert-hash=" + opts.DiscoveryTokenCAHash,
 		"--skip-phases=addon/kube-proxy",
 	}
-	if opts.APIServerEndpoint != "" {
-		args = append(args, "--control-plane", "--certificate-key="+opts.CertKey)
+	if opts.ControlPlane {
+		if opts.APIServerEndpoint == "" {
+			return Result{}, fmt.Errorf("control-plane join requires APIServerEndpoint")
+		}
+		args = append(args,
+			opts.APIServerEndpoint,
+			"--control-plane",
+			"--certificate-key="+opts.CertKey,
+		)
 	}
 	if opts.NodeIP != "" {
 		args = append(args, "--node-ip="+opts.NodeIP)
@@ -99,6 +112,12 @@ func (k *Kubeadm) Join(ctx context.Context, host string, opts KubeadmOptions) (R
 		return res, fmt.Errorf("kubeadm join failed: %w", res.Err)
 	}
 	return res, nil
+}
+
+// JoinControlPlane is a worker-friendly alias for adding a control-plane node.
+func (k *Kubeadm) JoinControlPlane(ctx context.Context, host string, opts KubeadmOptions) (Result, error) {
+	opts.ControlPlane = true
+	return k.Join(ctx, host, opts)
 }
 
 // Reset runs `kubeadm reset --cleanup-tmp-dir --cri-socket ...`.

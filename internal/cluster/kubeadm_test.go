@@ -71,22 +71,51 @@ func TestKubeadm_Init_BuildsArgs(t *testing.T) {
 	assert.Contains(t, cmd, "--certificate-key=abc123")
 }
 
-func TestKubeadm_Join_BuildsArgs(t *testing.T) {
+func TestKubeadm_Join_ControlPlane(t *testing.T) {
 	mock := NewMockExecutor()
 	defer mock.Close()
 	k := NewKubeadm(mock)
-	_, err := k.Join(context.Background(), "h", KubeadmOptions{
-		Token:                 "abcdef.1234567890abcdef",
-		DiscoveryTokenCAHash:  "sha256:deadbeef",
-		APIServerEndpoint:     "10.0.0.100:6443",
-		CertKey:               "certkey",
+	_, err := k.JoinControlPlane(context.Background(), "h", KubeadmOptions{
+		Token:                "abcdef.1234567890abcdef",
+		DiscoveryTokenCAHash: "sha256:deadbeef",
+		APIServerEndpoint:    "10.0.0.100:6443",
+		CertKey:              "certkey",
 	})
 	require.NoError(t, err)
 	require.NotEmpty(t, mock.Calls)
 	cmd := mock.Calls[0].Command
 	assert.Contains(t, cmd, "kubeadm join")
 	assert.Contains(t, cmd, "--token=abcdef.1234567890abcdef")
+	assert.Contains(t, cmd, "10.0.0.100:6443")
 	assert.Contains(t, cmd, "--control-plane")
+	assert.Contains(t, cmd, "--certificate-key=certkey")
+}
+
+func TestKubeadm_Init_CertificateValidity(t *testing.T) {
+	mock := NewMockExecutor()
+	defer mock.Close()
+	k := NewKubeadm(mock)
+	_, err := k.Init(context.Background(), "h", KubeadmOptions{
+		KubernetesVersion:   "v1.35.0",
+		PodCIDR:             "10.244.0.0/16",
+		ServiceCIDR:         "10.96.0.0/12",
+		CertificateValidity: "876000h",
+	})
+	require.NoError(t, err)
+	cmd := mock.Calls[0].Command
+	assert.Contains(t, cmd, "--certificate-validity=876000h")
+}
+
+func TestKubeadm_Join_ControlPlane_RequiresEndpoint(t *testing.T) {
+	mock := NewMockExecutor()
+	defer mock.Close()
+	k := NewKubeadm(mock)
+	_, err := k.Join(context.Background(), "h", KubeadmOptions{
+		ControlPlane: true,
+		Token:        "t", DiscoveryTokenCAHash: "h", CertKey: "c",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "APIServerEndpoint")
 }
 
 func TestKubeadm_Join_Worker(t *testing.T) {
