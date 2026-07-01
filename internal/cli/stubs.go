@@ -100,17 +100,6 @@ func homeDir() string {
 	return h
 }
 
-func newTuneCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "tune",
-		Short: "Apply host tuning profiles (S5)",
-	}
-	cmd.AddCommand(stubCmd("apply", "Apply tuning profile (S5)"))
-	cmd.AddCommand(stubCmd("show", "Show current vs desired tuning (S5)"))
-	cmd.AddCommand(stubCmd("reset", "Revert tuning to defaults (S5)"))
-	return cmd
-}
-
 func newClusterCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "cluster",
