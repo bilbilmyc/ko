@@ -1,16 +1,103 @@
 package cli
 
-import "github.com/spf13/cobra"
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
 
-// v0.0.1 S1: commands are stubs that print "not yet implemented" so the CLI surface is complete.
-// Subsequent slices (S2–S11) replace these with real implementations.
+	"github.com/spf13/cobra"
+
+	"github.com/ko-build/ko/internal/cluster"
+	"github.com/ko-build/ko/internal/logger"
+	"github.com/ko-build/ko/pkg/config"
+)
 
 func newInitCmd() *cobra.Command {
-	return stubCmd("init", "Initialize a Kubernetes cluster (S2)")
+	var (
+		runtimeFlag string
+		offline     bool
+		bundle      string
+	)
+	cmd := &cobra.Command{
+		Use:   "init",
+		Short: "Initialize a Kubernetes cluster on the first master node",
+		Long: `init runs the full single-master bootstrap on the first host listed
+in ` + "`nodes.masters`" + ` (or whichever host you pass via --master). It installs the
+configured container runtime, bootstraps kubeadm, runs ` + "`kubeadm init`" + `, then
+installs kube-vip and Cilium with kube-proxy replacement.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfgPath := flags.ConfigPath
+			if cfgPath == "" {
+				return fmt.Errorf("--config is required")
+			}
+			cfg, err := config.ParseFile(cfgPath)
+			if err != nil {
+				return fmt.Errorf("parse %q: %w", cfgPath, err)
+			}
+			cfg.ApplyDefaults()
+			if runtimeFlag != "" {
+				cfg.Runtime.Default = runtimeFlag
+			}
+			master := ""
+			if len(args) > 0 {
+				master = args[0]
+			} else if len(cfg.Nodes.Masters) > 0 {
+				master = cfg.Nodes.Masters[0]
+			}
+			if master == "" {
+				return fmt.Errorf("no master host: provide one as an argument or set nodes.masters in %s", cfgPath)
+			}
+
+			sshCfg := cluster.SSHConfig{
+				User:     cfg.Nodes.SSH.User,
+				Port:     cfg.Nodes.SSH.Port,
+				KeyFile:  cfg.Nodes.SSH.KeyFile,
+				Password: cfg.Nodes.SSH.Password,
+				Timeout:  60 * time.Second,
+			}
+			exec, err := cluster.NewSSHExecutor(sshCfg)
+			if err != nil {
+				return fmt.Errorf("init ssh executor: %w", err)
+			}
+			defer exec.Close()
+
+			init, err := cluster.NewInitFromConfig(cfg, exec)
+			if err != nil {
+				return err
+			}
+			init.Offline = offline || flags.Offline
+			init.BundlePath = bundle
+
+			logger.Info("starting init", "master", master, "runtime", cfg.Runtime.Default, "offline", init.Offline)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			defer cancel()
+			if err := init.Run(ctx, master); err != nil {
+				logger.Error("init failed", "err", err)
+				return err
+			}
+			cmd.Println("✓ cluster initialized")
+			cmd.Println("  kubeconfig:", filepath.Join(homeDir(), ".ko", "kube", "admin.conf"))
+			if cfg.HA.VIP != "" {
+				cmd.Printf("  apiserver:  https://%s:6443\n", cfg.HA.VIP)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&runtimeFlag, "runtime", "", "override runtime: containerd | docker")
+	cmd.Flags().BoolVar(&offline, "offline", false, "init from local bundle (use --bundle or --offline global)")
+	cmd.Flags().StringVar(&bundle, "bundle", "", "path to ko offline OCI image (when --offline)")
+	return cmd
 }
 
 func newResetCmd() *cobra.Command {
 	return stubCmd("reset", "Tear down a cluster and clean all nodes (S6)")
+}
+
+func homeDir() string {
+	h, _ := os.UserHomeDir()
+	return h
 }
 
 func newNodeCmd() *cobra.Command {

@@ -1,23 +1,23 @@
-package cluster
+package exec
 
 import (
 	"context"
 	"sync"
-
-	execx "github.com/ko-build/ko/internal/exec"
 )
 
+// MockExecutor is a minimal in-memory executor for unit tests. It records
+// every call and lets the test inject behaviour via RunFn / ScpFn.
 type MockExecutor struct {
-	execx.Base
+	Base
 	mu sync.Mutex
 
-	RunFn func(ctx context.Context, host, command string) execx.Result
+	RunFn func(ctx context.Context, host, command string) Result
 	ScpFn func(ctx context.Context, host, src, dst string) error
 
-	Calls []MockCall
+	Calls []Call
 }
 
-type MockCall struct {
+type Call struct {
 	Method  string
 	Host    string
 	Command string
@@ -25,24 +25,24 @@ type MockCall struct {
 	Dst     string
 }
 
-func NewMockExecutor() *MockExecutor { return &MockExecutor{} }
+func NewMock() *MockExecutor { return &MockExecutor{} }
 
-func (m *MockExecutor) Run(ctx context.Context, host, command string) execx.Result {
+func (m *MockExecutor) Run(ctx context.Context, host, command string) Result {
 	m.mu.Lock()
-	m.Calls = append(m.Calls, MockCall{Method: "Run", Host: host, Command: command})
+	m.Calls = append(m.Calls, Call{Method: "Run", Host: host, Command: command})
 	m.mu.Unlock()
 	if err := m.CheckOpen(); err != nil {
-		return execx.Result{Host: host, Command: command, Err: err}
+		return Result{Host: host, Command: command, Err: err}
 	}
 	if m.RunFn != nil {
 		return m.RunFn(ctx, host, command)
 	}
-	return execx.Result{Host: host, Command: command}
+	return Result{Host: host, Command: command}
 }
 
 func (m *MockExecutor) Scp(ctx context.Context, host, src, dst string) error {
 	m.mu.Lock()
-	m.Calls = append(m.Calls, MockCall{Method: "Scp", Host: host, Src: src, Dst: dst})
+	m.Calls = append(m.Calls, Call{Method: "Scp", Host: host, Src: src, Dst: dst})
 	m.mu.Unlock()
 	if err := m.CheckOpen(); err != nil {
 		return err

@@ -8,24 +8,23 @@ import (
 	"os/exec"
 	"runtime"
 	"time"
+
+	execx "github.com/ko-build/ko/internal/exec"
 )
 
 type LocalExecutor struct {
-	*baseExecutor
+	execx.Base
 	workdir string
 }
 
 func NewLocalExecutor() *LocalExecutor {
 	wd, _ := os.Getwd()
-	return &LocalExecutor{
-		baseExecutor: &baseExecutor{},
-		workdir:      wd,
-	}
+	return &LocalExecutor{workdir: wd}
 }
 
-func (l *LocalExecutor) Run(ctx context.Context, host, command string) Result {
-	res := Result{Host: host, Command: command}
-	if err := l.checkOpen(); err != nil {
+func (l *LocalExecutor) Run(ctx context.Context, host, command string) execx.Result {
+	res := execx.Result{Host: host, Command: command}
+	if err := l.CheckOpen(); err != nil {
 		res.Err = err
 		return res
 	}
@@ -34,7 +33,7 @@ func (l *LocalExecutor) Run(ctx context.Context, host, command string) Result {
 		return res
 	}
 
-	timeout := DefaultTimeout
+	timeout := execx.DefaultTimeout
 	if deadline, ok := ctx.Deadline(); ok {
 		if d := time.Until(deadline); d > 0 && d < timeout {
 			timeout = d
@@ -64,7 +63,7 @@ func (l *LocalExecutor) Run(ctx context.Context, host, command string) Result {
 }
 
 func (l *LocalExecutor) Scp(ctx context.Context, host, src, dst string) error {
-	if err := l.checkOpen(); err != nil {
+	if err := l.CheckOpen(); err != nil {
 		return err
 	}
 	if host != "" && host != "localhost" && host != "127.0.0.1" {
@@ -83,10 +82,7 @@ func (l *LocalExecutor) Scp(ctx context.Context, host, src, dst string) error {
 	return nil
 }
 
-func (l *LocalExecutor) Close() error {
-	l.markClosed()
-	return nil
-}
+func (l *LocalExecutor) Close() error { l.MarkClosed(); return nil }
 
 func parentDir(p string) string {
 	for i := len(p) - 1; i >= 0; i-- {

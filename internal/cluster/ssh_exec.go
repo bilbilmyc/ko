@@ -13,6 +13,8 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
+
+	execx "github.com/ko-build/ko/internal/exec"
 )
 
 type SSHConfig struct {
@@ -29,7 +31,7 @@ func (c SSHConfig) withDefaults() SSHConfig {
 		c.Port = 22
 	}
 	if c.Timeout == 0 {
-		c.Timeout = DefaultTimeout
+		c.Timeout = execx.DefaultTimeout
 	}
 	if c.User == "" {
 		c.User = "root"
@@ -38,30 +40,18 @@ func (c SSHConfig) withDefaults() SSHConfig {
 }
 
 type SSHExecutor struct {
-	*baseExecutor
+	execx.Base
 	config  SSHConfig
-	clients sync.Map // host -> *ssh.Client
-	dialFn  func(host string, config *ssh.ClientConfig) (*ssh.Client, error)
+	clients sync.Map
 }
 
 func NewSSHExecutor(cfg SSHConfig) (*SSHExecutor, error) {
 	cfg = cfg.withDefaults()
-	e := &SSHExecutor{
-		baseExecutor: &baseExecutor{},
-		config:       cfg,
-	}
+	e := &SSHExecutor{config: cfg}
 	if _, err := e.authMethods(); err != nil {
 		return nil, err
 	}
-	if e.dialFn == nil {
-		e.dialFn = e.defaultDial
-	}
 	return e, nil
-}
-
-func (s *SSHExecutor) defaultDial(host string, cfg *ssh.ClientConfig) (*ssh.Client, error) {
-	addr := net.JoinHostPort(host, fmt.Sprintf("%d", s.config.Port))
-	return ssh.Dial("tcp", addr, cfg)
 }
 
 func (s *SSHExecutor) clientConfig() (*ssh.ClientConfig, error) {
@@ -121,19 +111,17 @@ func (s *SSHExecutor) getClient(ctx context.Context, host string) (*ssh.Client, 
 		_ = c.Close()
 		s.clients.Delete(host)
 	}
-
 	cfg, err := s.clientConfig()
 	if err != nil {
 		return nil, err
 	}
-
 	dialer := &net.Dialer{Timeout: s.config.Timeout}
 	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, fmt.Sprintf("%d", s.config.Port)))
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", host, err)
 	}
-
-	ncc, chans, reqs, err := ssh.NewClientConn(conn, net.JoinHostPort(host, fmt.Sprintf("%d", s.config.Port)), cfg)
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", s.config.Port))
+	ncc, chans, reqs, err := ssh.NewClientConn(conn, addr, cfg)
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("ssh handshake %s: %w", host, err)
@@ -143,9 +131,9 @@ func (s *SSHExecutor) getClient(ctx context.Context, host string) (*ssh.Client, 
 	return client, nil
 }
 
-func (s *SSHExecutor) Run(ctx context.Context, host, command string) Result {
-	res := Result{Host: host, Command: command}
-	if err := s.checkOpen(); err != nil {
+func (s *SSHExecutor) Run(ctx context.Context, host, command string) execx.Result {
+	res := execx.Result{Host: host, Command: command}
+	if err := s.CheckOpen(); err != nil {
 		res.Err = err
 		return res
 	}
@@ -160,19 +148,12 @@ func (s *SSHExecutor) Run(ctx context.Context, host, command string) Result {
 		return res
 	}
 	defer sess.Close()
-
 	var stdout, stderr bytes.Buffer
 	sess.Stdout = &stdout
 	sess.Stderr = &stderr
-
-	type runResult struct {
-		err error
-	}
+	type runResult struct{ err error }
 	done := make(chan runResult, 1)
-	go func() {
-		done <- runResult{err: sess.Run(command)}
-	}()
-
+	go func() { done <- runResult{err: sess.Run(command)} }()
 	select {
 	case r := <-done:
 		res.Stdout = stdout.Bytes()
@@ -188,7 +169,7 @@ func (s *SSHExecutor) Run(ctx context.Context, host, command string) Result {
 }
 
 func (s *SSHExecutor) Scp(ctx context.Context, host, src, dst string) error {
-	if err := s.checkOpen(); err != nil {
+	if err := s.CheckOpen(); err != nil {
 		return err
 	}
 	client, err := s.getClient(ctx, host)
@@ -207,9 +188,6 @@ func (s *SSHExecutor) Scp(ctx context.Context, host, src, dst string) error {
 		return fmt.Errorf("new session: %w", err)
 	}
 	defer sess.Close()
-	go func() {
-		_, _ = sess.StdinPipe()
-	}()
 	w, err := sess.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("stdin pipe: %w", err)
@@ -229,7 +207,7 @@ func (s *SSHExecutor) Scp(ctx context.Context, host, src, dst string) error {
 }
 
 func (s *SSHExecutor) Close() error {
-	s.markClosed()
+	s.MarkClosed()
 	s.clients.Range(func(k, v any) bool {
 		_ = v.(*ssh.Client).Close()
 		s.clients.Delete(k)
@@ -250,12 +228,14 @@ func expandPath(p string) (string, error) {
 }
 
 func shellQuote(s string) string {
-	out := `"`
+	var b bytes.Buffer
+	b.WriteByte('"')
 	for _, r := range s {
 		if r == '"' || r == '\\' || r == '$' || r == '`' {
-			out += `\`
+			b.WriteByte('\\')
 		}
-		out += string(r)
+		b.WriteRune(r)
 	}
-	return out + `"`
+	b.WriteByte('"')
+	return b.String()
 }
