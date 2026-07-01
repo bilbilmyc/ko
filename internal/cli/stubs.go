@@ -100,18 +100,6 @@ func homeDir() string {
 	return h
 }
 
-func newNodeCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "node",
-		Short: "Manage cluster nodes (S4)",
-	}
-	cmd.AddCommand(stubCmd("add", "Add a node to the cluster (S4)"))
-	cmd.AddCommand(stubCmd("remove", "Remove a node from the cluster (S4)"))
-	cmd.AddCommand(stubCmd("list", "List cluster nodes (S4)"))
-	cmd.AddCommand(stubCmd("label", "Label a node (S4)"))
-	return cmd
-}
-
 func newTuneCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "tune",
