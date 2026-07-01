@@ -96,17 +96,6 @@ func homeDir() string {
 	return h
 }
 
-func newPackCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "pack",
-		Short: "Build / push / inspect offline bundles (S7)",
-	}
-	cmd.AddCommand(stubCmd("build", "Build offline OCI bundle (S7)"))
-	cmd.AddCommand(stubCmd("push", "Push bundle to registry (S7)"))
-	cmd.AddCommand(stubCmd("inspect", "Show bundle contents (S7)"))
-	return cmd
-}
-
 func newDashboardCmd() *cobra.Command {
 	return stubCmd("dashboard", "Launch the Web Dashboard (S9)")
 }
