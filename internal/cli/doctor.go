@@ -3,31 +3,14 @@ package cli
 import (
 	"context"
 	"fmt"
-	"os"
-	"runtime"
 	"time"
 
-	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/spf13/cobra"
 
 	"github.com/ko-build/ko/internal/cluster"
-	"github.com/ko-build/ko/internal/logger"
+	"github.com/ko-build/ko/internal/doctor"
 	"github.com/ko-build/ko/pkg/config"
 )
-
-type checkResult struct {
-	Name    string
-	OK      bool
-	Message string
-}
-
-func (c checkResult) String() string {
-	mark := "✓"
-	if !c.OK {
-		mark = "✗"
-	}
-	return fmt.Sprintf("  %s  %-22s  %s", mark, c.Name, c.Message)
-}
 
 func newDoctorCmd() *cobra.Command {
 	var noSSH bool
@@ -35,14 +18,18 @@ func newDoctorCmd() *cobra.Command {
 		Use:   "doctor",
 		Short: "Run preflight checks on the local host and (if --config is set) remote nodes",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			results := runLocalChecks()
+			results := doctor.LocalChecks()
 			if !noSSH && flags.ConfigPath != "" {
 				results = append(results, runRemoteChecks(flags.ConfigPath)...)
 			}
 			failed := 0
 			cmd.Println("ko doctor:")
 			for _, r := range results {
-				cmd.Println(r.String())
+				mark := "✓"
+				if !r.OK {
+					mark = "✗"
+				}
+				cmd.Printf("  %s  %-32s  %s\n", mark, r.Name, r.Message)
 				if !r.OK {
 					failed++
 				}
@@ -60,50 +47,10 @@ func newDoctorCmd() *cobra.Command {
 	return cmd
 }
 
-func runLocalChecks() []checkResult {
-	results := []checkResult{
-		checkOS(),
-		checkArch(),
-		checkDisk("/"),
-	}
-	return results
-}
-
-func checkOS() checkResult {
-	supported := map[string]bool{
-		"linux": true,
-	}
-	if !supported[runtime.GOOS] {
-		return checkResult{Name: "OS", OK: false, Message: fmt.Sprintf("%s (k8s nodes must be Linux)", runtime.GOOS)}
-	}
-	return checkResult{Name: "OS", OK: true, Message: runtime.GOOS}
-}
-
-func checkArch() checkResult {
-	arch := runtime.GOARCH
-	if arch != "amd64" && arch != "arm64" {
-		return checkResult{Name: "Arch", OK: false, Message: fmt.Sprintf("%s (supported: amd64, arm64)", arch)}
-	}
-	return checkResult{Name: "Arch", OK: true, Message: arch}
-}
-
-func checkDisk(path string) checkResult {
-	usage, err := disk.Usage(path)
-	if err != nil {
-		return checkResult{Name: "Disk " + path, OK: false, Message: err.Error()}
-	}
-	free := usage.Free
-	need := uint64(20) * 1024 * 1024 * 1024
-	if free < need {
-		return checkResult{Name: "Disk " + path, OK: false, Message: fmt.Sprintf("only %s free, need ≥20G", humanBytes(free))}
-	}
-	return checkResult{Name: "Disk " + path, OK: true, Message: fmt.Sprintf("%s free", humanBytes(free))}
-}
-
-func runRemoteChecks(path string) []checkResult {
+func runRemoteChecks(path string) []doctor.Result {
 	cfg, err := config.ParseFile(path)
 	if err != nil {
-		return []checkResult{{Name: "Config", OK: false, Message: err.Error()}}
+		return []doctor.Result{{Name: "Config", OK: false, Message: err.Error()}}
 	}
 	cfg.ApplyDefaults()
 
@@ -117,62 +64,17 @@ func runRemoteChecks(path string) []checkResult {
 		Password: cfg.Nodes.SSH.Password,
 		Timeout:  10 * time.Second,
 	}
-	exec, err := cluster.NewSSHExecutor(sshCfg)
+	ex, err := cluster.NewSSHExecutor(sshCfg)
 	if err != nil {
-		return []checkResult{{Name: "SSH init", OK: false, Message: err.Error()}}
+		return []doctor.Result{{Name: "SSH init", OK: false, Message: err.Error()}}
 	}
-	defer exec.Close()
+	defer ex.Close()
 
-	results := make([]checkResult, 0, len(hosts))
+	results := make([]doctor.Result, 0, len(hosts)*5)
 	for _, h := range hosts {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		res := exec.Run(ctx, h, "uname -a")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		results = append(results, doctor.RemoteChecks(ctx, ex, h)...)
 		cancel()
-		if res.Failed() {
-			results = append(results, checkResult{
-				Name:    fmt.Sprintf("SSH %s", h),
-				OK:      false,
-				Message: res.Error(),
-			})
-			continue
-		}
-		results = append(results, checkResult{
-			Name:    fmt.Sprintf("SSH %s", h),
-			OK:      true,
-			Message: string(trimNewline(res.Stdout)),
-		})
 	}
 	return results
 }
-
-func trimNewline(b []byte) []byte {
-	for len(b) > 0 && (b[len(b)-1] == '\n' || b[len(b)-1] == '\r') {
-		b = b[:len(b)-1]
-	}
-	return b
-}
-
-func humanBytes(n uint64) string {
-	const (
-		KiB = 1024
-		MiB = 1024 * KiB
-		GiB = 1024 * MiB
-		TiB = 1024 * GiB
-	)
-	switch {
-	case n >= TiB:
-		return fmt.Sprintf("%.1fT", float64(n)/TiB)
-	case n >= GiB:
-		return fmt.Sprintf("%.1fG", float64(n)/GiB)
-	case n >= MiB:
-		return fmt.Sprintf("%.1fM", float64(n)/MiB)
-	case n >= KiB:
-		return fmt.Sprintf("%.1fK", float64(n)/KiB)
-	default:
-		return fmt.Sprintf("%dB", n)
-	}
-}
-
-// guard: avoid unused import warnings when logger isn't otherwise referenced
-var _ = logger.Info
-var _ = os.Getenv
