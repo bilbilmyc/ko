@@ -96,10 +96,6 @@ func homeDir() string {
 	return h
 }
 
-func newDashboardCmd() *cobra.Command {
-	return stubCmd("dashboard", "Launch the Web Dashboard (S9)")
-}
-
 func newCompletionCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:       "completion <bash|zsh|fish>",
@@ -116,17 +112,6 @@ func newCompletionCmd() *cobra.Command {
 			case "fish":
 				return cmd.Root().GenFishCompletion(cmd.OutOrStdout(), true)
 			}
-			return nil
-		},
-	}
-}
-
-func stubCmd(use, desc string) *cobra.Command {
-	return &cobra.Command{
-		Use:   use,
-		Short: desc,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cmd.Printf("not yet implemented: %s\n", use)
 			return nil
 		},
 	}
