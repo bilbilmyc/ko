@@ -91,24 +91,9 @@ installs kube-vip and Cilium with kube-proxy replacement.`,
 	return cmd
 }
 
-func newResetCmd() *cobra.Command {
-	return stubCmd("reset", "Tear down a cluster and clean all nodes (S6)")
-}
-
 func homeDir() string {
 	h, _ := os.UserHomeDir()
 	return h
-}
-
-func newClusterCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "cluster",
-		Short: "Cluster-level operations (S6)",
-	}
-	cmd.AddCommand(stubCmd("info", "Show cluster info (S6)"))
-	cmd.AddCommand(stubCmd("certs", "List certificate expiry (S6)"))
-	cmd.AddCommand(stubCmd("backup", "etcd snapshot (S6, stacked mode only)"))
-	return cmd
 }
 
 func newPackCmd() *cobra.Command {
