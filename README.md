@@ -60,30 +60,50 @@ make build-all       # 同时构建 amd64 + arm64
 ### 离线安装（推荐 / 默认）
 
 > 项目主用场景：公司内部 + 真离线。bundle 含所有镜像 + 自举 in-cluster registry，**全程不访问公网**。
+>
+> **版本控制说明**：ko 工具走 GitHub release（`v0.0.x`），bundle 走公司内部存储（`bundle-k8s<X.Y.Z>-cilium<X.Y.Z>-<YYYYMMDD>-<arch>.oci.tar.gz`）。两者解耦，按需组合。
+
+#### 运维视角（部署新集群）
 
 ```bash
-# 1. 在能上网的机器上打包（自动同时构建 amd64 + arm64）
-#    bundle 含 containerd + kubeadm 二进制 + k8s 控制面镜像 + registry:2
-#    仓库镜像本身 + cilium 全部镜像 + cilium helm chart
-ko pack build --arch all --output ./dist --version v0.0.4
-# 产物：dist/ko-v0.0.4-multi.oci.tar.gz  (~826MB amd64 layer)
+# 1. 从公司内部 NFS 拿 bundle（所有集群节点挂载同一份 NFS）
+ls /mnt/ko-store/
+# bundle-k8s1.32.0-cilium1.16.1-20260702-amd64.oci.tar.gz
+# bundle-k8s1.32.0-cilium1.16.1-20260702-multi.oci.tar.gz
+cp /mnt/ko-store/bundle-k8s1.32.0-cilium1.16.1-20260702-multi.oci.tar.gz .
 
-# 2. 生成 cluster.hcl（sealos 风格：选 profile，写带文档注释的配置）
+# 2. 从 GitHub release 拿 ko 二进制
+curl -sSL https://github.com/bilbilmyc/ko/releases/download/v0.0.4/ko-linux-amd64 -o ko
+chmod +x ko
+
+# 3. 生成 cluster.hcl（sealos 风格：选 profile，写带文档注释的配置）
 #    可选 profile: single | ha | external-etcd
-ko init --generate-config=ha -o cluster.hcl
+./ko init --generate-config=ha -o cluster.hcl
 
-# 3. 按需编辑 cluster.hcl（已自动 include 每个字段的注释）
+# 4. 按需编辑 cluster.hcl（已自动 include 每个字段的注释）
 
-# 4. 预检
-ko doctor --config cluster.hcl
+# 5. 预检
+./ko doctor --config cluster.hcl
 
-# 5. 把 ko 二进制 + bundle 拷到目标机器后离线 init
-#    master-1 会自举 ko.local:5000 镜像仓库；
-#    kubeadm / cilium / node join 全部从本地仓库拉，全程不访问公网
-ko init --config cluster.hcl --offline --bundle ./ko-v0.0.4-multi.oci.tar.gz
+# 6. 离线 init（master-1 会自举 ko.local:5000 镜像仓库；
+#    kubeadm / cilium / node join 全部从本地仓库拉，全程不访问公网）
+./ko init --config cluster.hcl --offline --bundle ./bundle-k8s1.32.0-cilium1.16.1-20260702-multi.oci.tar.gz
 ```
 
 完整流程和故障排查见 [RUNBOOK §1 离线部署](docs/RUNBOOK.md#1-离线部署s17真离线--in-cluster-registry)。
+
+#### 烤包员视角（烤新 bundle 推到 NFS）
+
+```bash
+# 1. 在能上网的机器上烤新 bundle（自动同时构建 amd64 + arm64）
+#    bundle 含 containerd + kubeadm 二进制 + k8s 控制面镜像 + registry:2
+#    仓库镜像本身 + cilium 全部镜像 + cilium helm chart
+ko pack build --arch all --output ./dist --version bundle-k8s1.32.0-cilium1.16.1-20260702
+# 产物：dist/bundle-k8s1.32.0-cilium1.16.1-20260702-multi.oci.tar.gz  (~826MB amd64 layer)
+
+# 2. 推到公司内部 NFS（运维挂载路径）
+scp dist/bundle-k8s1.32.0-cilium1.16.1-20260702-multi.oci.tar.gz ko-nfs:/mnt/ko-store/
+```
 
 ### 在线安装（备选 / 不推荐，仅供测试）
 

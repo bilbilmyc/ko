@@ -124,12 +124,33 @@ cni     { plugin  = "cilium" }
 
 ### 1.5 拷贝交付物到目标机器
 
-```bash
-# 从内部存储拿 bundle
-scp <internal-storage>/ko-v0.0.4-multi.oci.tar.gz .
+> **版本控制说明**：ko 工具走 GitHub release（v0.0.x）；bundle 走公司内部存储（独立版本号 `bundle-k8s<X.Y.Z>-cilium<X.Y.Z>-<YYYYMMDD>-<arch>.oci.tar.gz`）。两者解耦，按需组合。
 
-# 把 ko 二进制 + bundle + cluster.hcl 一起推到 master-1
-scp bin/ko-linux-amd64 ko-v0.0.4-multi.oci.tar.gz cluster.hcl root@10.0.0.11:
+```bash
+# 1. 从 NFS 拿 bundle
+scp /mnt/ko-store/bundle-k8s1.32.0-cilium1.16.1-20260702-multi.oci.tar.gz .
+
+# 2. 从 GitHub release 拿 ko 二进制（或本地 make build）
+wget https://github.com/bilbilmyc/ko/releases/download/v0.0.4/ko-linux-amd64
+chmod +x ko-linux-amd64
+
+# 3. 打交付物 tar（含 ko + bundle + 三个 profile 模板；TODO: #65 完成后此命令可用）
+./ko pack ship \
+  --output ko-delivery-v0.0.4.tar.gz \
+  --bundle ./bundle-k8s1.32.0-cilium1.16.1-20260702-multi.oci.tar.gz \
+  --include-configs
+# 产物：ko-delivery-v0.0.4.tar.gz
+#   ├─ ko-linux-amd64              ← ko 二进制（来自 GitHub release v0.0.4）
+#   ├─ bundle-k8s1.32.0-cilium1.16.1-20260702-multi.oci.tar.gz  ← 来自 NFS
+#   ├─ cluster.hcl.single
+#   ├─ cluster.hcl.ha
+#   └─ cluster.hcl.external-etcd
+
+# 4. 推到 master-1
+scp ko-delivery-v0.0.4.tar.gz root@10.0.0.11:
+
+# 5. 在 master-1 解 tar
+ssh root@10.0.0.11 'mkdir ko-delivery && tar -xzf ko-delivery-v0.0.4.tar.gz -C ko-delivery'
 ```
 
 ### 1.6 离线 init

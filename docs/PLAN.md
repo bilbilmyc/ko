@@ -415,13 +415,28 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 - 集群迁移
 - **公网 / 在线模式相关**：不做在线 init 流程优化；bundle 不上 GitHub release 之外的公网 registry（GitHub release 留给开发自测）
 
-### 8.6 公司内部存储 + 交付物（用户决策待补）
+### 8.6 ko / bundle 双轨版本控制（用户 2026-07-02 决策）
 
-> 用户会做内部存储放 bundle tar 包；交付时 ko 二进制 + bundle tar 一并交付。具体形态未定，先列待决策项。
+> **核心原则**：**ko 工具本身**走 GitHub release + git tag（独立版本号 v0.0.x）；**bundle（镜像 + chart + 二进制）**走公司内部存储（独立版本号）。**两者解耦**——bundle 不跟 ko release tag，新 k8s 版本 / cilium 版本可以单独烤 bundle，不动 ko 代码。
 
-- [ ] **(i) 内部 bundle 存储形态**（#60）— HTTP 文件服务器 / NFS / MinIO / 自建对象存储 / 别的？决定后 RUNBOOK §2 写明 `ko pack / ko init` 怎么从内部存储拉 bundle；SPEC §6 写 bundle 分发链路。
-- [ ] **(ii) 交付物 tar 包打包方案**（#61）— 合并成一个 tar（`ko-v0.0.4-bundle.tar.gz` 含 ko + bundle + 配置模板），还是分两个 tar（`ko` + `bundle`），或新增 `ko pack ship --output delivery.tar.gz` 命令一键打包？决定后实现 + RUNBOOK §2.8 写明交付物结构。
-- [ ] **(iii) RUNBOOK / README 重排**（#62）— RUNBOOK §1（HA 多 master 在线）和 §2（离线部署）互换次序：§1 离线（主线）、§2 在线（折叠成"备选"小节）。README "快速开始" 同步：离线示例打头。**任务轻量、纯文档**。
+**已定决策**：
+
+- ✅ **NFS / 文件共享挂载**（#60 已完成）— 所有集群节点挂载同一份 NFS（如 `/mnt/ko-store/`），bundle 直接放文件系统。`ko init --bundle /mnt/ko-store/bundle-k8s1.32.0-cilium1.16.1-20260702-multi.oci.tar.gz`。
+- ✅ **单 tar 交付物**（#61 已完成）— `ko pack ship --output delivery.tar.gz --bundle /mnt/ko-store/<bundle-name>.oci.tar.gz --include-configs` 打一份 tar（含 `ko` 二进制 + 指定 bundle + 三个 profile 模板），运维解压即用。
+- ✅ **强制离线**（#64 待做）— `ko init` / `ko node add` 必须带 `--offline --bundle <path>`；不带就报错退出。开发自测在线场景用 `--allow-online` flag 跳过。
+
+**仍待拍**：
+
+- [ ] **(iv) bundle 版本号命名约定**（#63 待做）— 推荐 `bundle-k8s<X.Y.Z>-cilium<X.Y.Z>-<YYYYMMDD>-<arch>.oci.tar.gz`，运维一眼看出内容 + 日期 + 架构。**待用户确认**。
+
+**执行步骤**（每条独立可验证）：
+
+- [ ] **(α) #64 强制离线（代码）** — `internal/cli/init.go` 和 `internal/cli/node.go` 加：检测 `!cmd.Flags().Changed("offline")` 时 `return fmt.Errorf("纯离线项目，ko init 必须带 --offline --bundle <path>（开发自测用 --allow-online 跳过）")`。同步加 `--allow-online` flag。单元测试覆盖。
+- [ ] **(β) `ko pack ship` 命令**（#65 待创建）— 新增 `internal/cli/pack.go::newPackShipCmd`，把 ko 二进制 + bundle + 三个 profile 模板（single / ha / external-etcd）打成一个 tar。命令格式见上文。RUNBOOK §1.5 引用。
+- [ ] **(γ) #63 bundle 命名约定**（待用户拍）— 拍后更新 `internal/image/upstream.go` 里默认 bundle 名生成逻辑（如果用日期戳）；RUNBOOK §1.5 引用。
+- [ ] **(δ) RUNBOOK §1.5 + README 离线示例** 改 NFS 路径 + delivery tar — 见 #62 子任务。
+
+### 8.7 代码 / 决策锚点（防止后续 session 想"为什么这么写"）
 
 ### 8.7 代码 / 决策锚点（防止后续 session 想"为什么这么写"）
 
