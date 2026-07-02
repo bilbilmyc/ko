@@ -2,7 +2,7 @@
 
 Kubernetes 集群生命周期管理工具，对标 [sealos](https://github.com/labring/sealos)，**离线优先**。
 
-> 当前状态：**v0.0.1 已发布**（[release](https://github.com/bilbilmyc/ko/releases/tag/v0.0.1)）。规格见 [`docs/SPEC.md`](docs/SPEC.md)，实施计划见 [`docs/PLAN.md`](docs/PLAN.md)。
+> 当前状态：**v0.0.2 已发布**（[release](https://github.com/bilbilmyc/ko/releases/tag/v0.0.2)）。规格见 [`docs/SPEC.md`](docs/SPEC.md)，实施计划见 [`docs/PLAN.md`](docs/PLAN.md)。
 
 ## 特点
 
@@ -176,8 +176,8 @@ docs/                       SPEC / PLAN / CHANGELOG
 
 | 版本 | 状态 | 目标 |
 |---|---|---|
-| v0.0.1 | ✅ 已发布（2026-07-02） | 首个可用版：init / node / tune / reset / dashboard + 离线大镜像包 + amd64+arm64 + 外部 etcd + restore + reset --purge + dashboard 硬化 |
-| v0.0.x | 📋 S17 真离线已合入 | bundle 含 registry/kubeadm/k8s-images/cilium-images；in-cluster registry + containerd mirror rewrite（下一 release 重打完整 bundle） |
+| v0.0.2 | ✅ 已发布（2026-07-02） | **真离线 release** — S17 自举 in-cluster registry；bundle 含 registry/kubeadm/k8s-images/cilium-images；containerd mirror rewrite 绕开公网 |
+| v0.0.1 | 📦 历史 release | 首个可用版（bundle 仅含 containerd，**真离线请用 v0.0.2**） |
 | v0.1.x | 📋 候选 | HA 外部 etcd / 切换到用户魔改 containerd / eBPF 自动检测 / SSO |
 | v0.2+ | 待定 | 看 v0.0.x 反馈决定 |
 

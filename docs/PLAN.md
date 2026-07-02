@@ -332,7 +332,7 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 
 ## 8. 当前状态 + 下一项
 
-> 实时状态：v0.0.1 已发布；S17 真实离线（in-cluster registry）已完成代码 + 测试 + 文档，下一版 release 重打完整 bundle。
+> 实时状态：v0.0.1 已发布；S17 真实离线（in-cluster registry）已完成代码 + 测试 + 文档。下一步打 v0.0.2 tag 重跑 release workflow 让 bundle 包含完整镜像清单。
 > 下面"下一项"按"可单 session 落地 + 不需新基础设施"挑。
 
 ### 8.1 已合入 Unreleased
@@ -345,9 +345,12 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 | `ed50f66` | Dashboard 加固（rate limit + audit log，`golang.org/x/time/rate`） |
 | `888e076` | CI 修复：arm64 job 装 `binfmt-support` |
 | `500731e` | release.yml 修复：files glob 匹配 `dist/*.oci.tar.gz` |
-| `S17` | **真实离线** — bundle 加 registry/kubeadm/k8s-images/cilium-images layers；`OfflineRunner` 在 master-1 自举 in-cluster registry；containerd mirror rewrite + `ko.local` hosts 解析；kubeadm init/join 全走 `--image-repository=ko.local:5000` |
+| `2dd91ce` | S17 真实离线（代码） — bundle 加 registry/kubeadm/k8s-images/cilium-images layers；`OfflineRunner` 在 master-1 自举 in-cluster registry；containerd mirror rewrite + `ko.local` hosts 解析 |
+| `991214f` | S17 真实离线（文档） — CHANGELOG Unreleased + PLAN §8 + RUNBOOK §2 + README |
 
-**v0.0.1 已发布** — tag 指向 `500731e`，release 产物：`ko-linux-amd64` / `ko-linux-arm64` / `ko-v0.0.1-multi.oci.tar.gz`（**注意**：v0.0.1 的 bundle 只含 containerd，真离线能力随 S17 发布；S17 之后会重打一个含完整镜像的 bundle tag）
+**v0.0.1 已发布** — tag 指向 `500731e`，release 产物：`ko-linux-amd64` / `ko-linux-arm64` / `ko-v0.0.1-multi.oci.tar.gz`（**注意**：v0.0.1 的 bundle 只含 containerd，真离线能力随 S17 发布）
+
+**v0.0.2 即将发布** — tag 指向 `991214f`，重新跑 release workflow 让 bundle 包含完整镜像清单（6 类 layer），才是真的可离线 init
 
 ### 8.2 v0.0.1 收尾 P0（必须）
 
