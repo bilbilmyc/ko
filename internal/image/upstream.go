@@ -4,6 +4,9 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -260,6 +263,11 @@ func (p *cliPuller) Save(ctx context.Context, dest string, images []string) erro
 	if err != nil {
 		return fmt.Errorf("%s save: %w (out=%s)", p.bin, err, strings.TrimSpace(string(out)))
 	}
+	preStat, _ := os.Stat(dest)
+	preSize := int64(0)
+	if preStat != nil {
+		preSize = preStat.Size()
+	}
 	// docker / nerdctl emit docker-archive tarballs that store a separate
 	// copy of every shared layer blob under blobs/sha256/<digest>. On
 	// storage drivers without cross-image dedup (docker's vfs in GitHub
@@ -275,7 +283,16 @@ func (p *cliPuller) Save(ctx context.Context, dest string, images []string) erro
 	}
 	if err := os.Rename(deduped, dest); err != nil {
 		logger.Warn("rename deduped tar failed; using un-deduped tar", "err", err)
+		return nil
 	}
+	postStat, _ := os.Stat(dest)
+	postSize := int64(0)
+	if postStat != nil {
+		postSize = postStat.Size()
+	}
+	logger.Info("docker-archive dedup applied",
+		"pre_bytes", preSize, "post_bytes", postSize,
+		"ratio", fmt.Sprintf("%.2fx", float64(preSize)/float64(postSize+1)))
 	return nil
 }
 
@@ -286,13 +303,105 @@ func (p *cliPuller) Save(ctx context.Context, dest string, images []string) erro
 // The output remains a valid docker-archive — ctr images import looks up
 // blobs by the path written in manifest.json, which is content-addressable
 // by sha256. We just collapse duplicate copies in the tar stream.
+// DedupDockerArchive is the exported form of dedupDockerArchive for testing
+// from other packages; the implementation is the same.
+var DedupDockerArchive = dedupDockerArchive
+
+// dedupDockerArchive reads a docker-archive tar at src and writes a copy at
+// dst with each unique-content blob stored exactly once. Non-blob entries
+// (manifest.json, configs, repositories) are written in source order.
+//
+// Dedup is keyed on each blob's actual sha256, not on its tar path. docker
+// save normally stores blobs at blobs/sha256/<digest> where the path
+// matches the content hash, but docker's vfs storage driver (the default
+// on GitHub Actions runners) doesn't dedup across images, so the same
+// content can appear under the same path multiple times. We catch that —
+// and the rarer case of the same content under different paths — by
+// hashing each blob as we read it.
+//
+// The output is a valid docker-archive: ctr images import looks up blobs by
+// the path written in manifest.json, which we rewrite so every layer points
+// at the surviving canonical blob path.
 func dedupDockerArchive(src, dst string) error {
+	type blobEntry struct {
+		header  *tar.Header
+		content []byte
+	}
+	type rawEntry struct {
+		header  *tar.Header
+		content []byte
+	}
+
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
+
 	tr := tar.NewReader(in)
+	blobs := map[string]*blobEntry{} // sha256 -> first-seen entry
+	var blobOrder []string           // sha256 keys in first-seen order
+	var nonBlob []rawEntry           // manifest.json + configs etc, source order
+	var manifestData []byte
+
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		body, err := io.ReadAll(tr)
+		if err != nil {
+			return err
+		}
+		hCopy := *h
+		hCopy.Size = int64(len(body))
+		if h.Name == "manifest.json" {
+			manifestData = body
+			nonBlob = append(nonBlob, rawEntry{header: &hCopy, content: body})
+			continue
+		}
+		if !strings.HasPrefix(h.Name, "blobs/sha256/") {
+			nonBlob = append(nonBlob, rawEntry{header: &hCopy, content: body})
+			continue
+		}
+		sum := sha256.Sum256(body)
+		key := hex.EncodeToString(sum[:])
+		if _, exists := blobs[key]; !exists {
+			blobs[key] = &blobEntry{header: &hCopy, content: body}
+			blobOrder = append(blobOrder, key)
+		}
+	}
+	if len(manifestData) == 0 {
+		return fmt.Errorf("no manifest.json in docker-archive; refusing to dedup")
+	}
+
+	// Rewrite manifest.json so each image's Layers point at the surviving
+	// (canonical) blob path. With the first-seen-wins rule above, every
+	// input path maps to itself — but the manifest might still reference
+	// paths that no longer exist in the output (if docker save emitted
+	// the same content under multiple distinct paths). In that case we
+	// fall back to looking up by content hash.
+	canonical := make(map[string]string, len(blobOrder))
+	for _, key := range blobOrder {
+		canonical[blobs[key].header.Name] = blobs[key].header.Name
+	}
+	hashToCanonical := make(map[string]string, len(blobOrder))
+	for _, key := range blobOrder {
+		hashToCanonical[key] = blobs[key].header.Name
+	}
+	rewrittenManifest, err := rewriteManifestLayers(manifestData, canonical, hashToCanonical)
+	if err != nil {
+		return err
+	}
+	for i := range nonBlob {
+		if nonBlob[i].header.Name == "manifest.json" {
+			nonBlob[i].content = rewrittenManifest
+			nonBlob[i].header.Size = int64(len(rewrittenManifest))
+		}
+	}
 
 	out, err := os.Create(dst)
 	if err != nil {
@@ -302,63 +411,53 @@ func dedupDockerArchive(src, dst string) error {
 	tw := tar.NewWriter(out)
 	defer tw.Close()
 
-	// First pass: collect manifest.json so we know which blobs each image
-	// expects. We don't actually need it to dedup — manifest.json still
-	// references the same path after dedup — but we log if it looks
-	// malformed so dedup failures are diagnosable.
-	var manifestData []byte
-	for {
-		h, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
+	for _, e := range nonBlob {
+		if err := tw.WriteHeader(e.header); err != nil {
 			return err
 		}
-		if h.Name == "manifest.json" {
-			manifestData, err = io.ReadAll(tr)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	if len(manifestData) == 0 {
-		return fmt.Errorf("no manifest.json in docker-archive; refusing to dedup")
-	}
-
-	// Second pass: rewrite the tar with each blob present only once.
-	seen := make(map[string]bool)
-	if _, err := in.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	tr = tar.NewReader(in)
-	for {
-		h, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
+		if _, err := tw.Write(e.content); err != nil {
 			return err
 		}
-		isBlob := strings.HasPrefix(h.Name, "blobs/sha256/")
-		if isBlob && seen[h.Name] {
-			// Drain the entry without writing it.
-			if _, err := io.Copy(io.Discard, tr); err != nil {
-				return err
-			}
-			continue
-		}
-		if isBlob {
-			seen[h.Name] = true
-		}
-		if err := tw.WriteHeader(h); err != nil {
+	}
+	for _, key := range blobOrder {
+		b := blobs[key]
+		if err := tw.WriteHeader(b.header); err != nil {
 			return err
 		}
-		if _, err := io.Copy(tw, tr); err != nil {
+		if _, err := tw.Write(b.content); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// rewriteManifestLayers rewrites manifest.json so each image's Layers list
+// points at the canonical (surviving) blob path. `canonical` maps input
+// path -> canonical path; `hashToCanonical` maps content sha256 -> canonical
+// path, used when the input path doesn't appear in `canonical` (a docker
+// save bug we still want to handle gracefully).
+func rewriteManifestLayers(manifestData []byte, canonical map[string]string, hashToCanonical map[string]string) ([]byte, error) {
+	var manifest []map[string]any
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		return nil, err
+	}
+	for _, img := range manifest {
+		layers, _ := img["Layers"].([]any)
+		for i, l := range layers {
+			p, _ := l.(string)
+			if c, ok := canonical[p]; ok {
+				layers[i] = c
+				continue
+			}
+			if len(p) == 64 {
+				if c, ok := hashToCanonical[p]; ok {
+					layers[i] = c
+				}
+			}
+		}
+		img["Layers"] = layers
+	}
+	return json.Marshal(manifest)
 }
 
 // wrapBinaryAsTarGz wraps a single downloaded binary file (e.g. kubeadm)

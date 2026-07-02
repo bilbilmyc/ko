@@ -2,9 +2,11 @@ package image
 
 import (
 	"archive/tar"
+	"encoding/json"
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -159,6 +161,74 @@ func TestDedupDockerArchive_CollapsesDuplicateBlobs(t *testing.T) {
 	}
 	assert.Equal(t, 1, sharedCount, "shared blob must appear exactly once in deduped tar")
 	assert.True(t, sawManifest, "manifest.json must be preserved")
+}
+
+// TestDedupDockerArchive_OnRealDockerSave verifies dedup works on a real
+// `docker save` output, not just a synthetic tar. Skips when docker isn't on
+// PATH (e.g. CI sandbox). The point of the test is to surface the case where
+// the host's docker daemon already dedup'd at save time — dedup must be a
+// no-op then, not corrupt the tar.
+func TestDedupDockerArchive_OnRealDockerSave(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skipf("docker not on PATH: %v", err)
+	}
+	tmp := t.TempDir()
+	srcImg := "registry.k8s.io/pause:3.10"
+	if out, err := exec.Command("docker", "pull", srcImg).CombinedOutput(); err != nil {
+		t.Skipf("docker pull %s: %v (%s)", srcImg, err, string(out))
+	}
+	srcTar := tmp + "/pause.tar"
+	if out, err := exec.Command("docker", "save", "-o", srcTar, srcImg).CombinedOutput(); err != nil {
+		t.Fatalf("docker save: %v (%s)", err, string(out))
+	}
+	preStat, err := os.Stat(srcTar)
+	require.NoError(t, err)
+
+	dst := tmp + "/pause.dedup.tar"
+	require.NoError(t, dedupDockerArchive(srcTar, dst))
+
+	// Output must still parse as a docker-archive: manifest.json present,
+	// referenced layers all present as blobs.
+	in, err := os.Open(dst)
+	require.NoError(t, err)
+	defer in.Close()
+	tr := tar.NewReader(in)
+	var manifestData []byte
+	seen := map[string]bool{}
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		require.NoError(t, err)
+		if h.Name == "manifest.json" {
+			manifestData, err = io.ReadAll(tr)
+			require.NoError(t, err)
+			continue
+		}
+		if strings.HasPrefix(h.Name, "blobs/sha256/") {
+			seen[h.Name] = true
+		} else {
+			_, _ = io.Copy(io.Discard, tr)
+		}
+	}
+	require.NotEmpty(t, manifestData, "manifest.json must survive dedup")
+
+	var manifest []map[string]any
+	require.NoError(t, json.Unmarshal(manifestData, &manifest))
+	require.NotEmpty(t, manifest)
+	imgs := manifest[0]
+	layers, _ := imgs["Layers"].([]any)
+	for _, l := range layers {
+		path, _ := l.(string)
+		require.True(t, seen[path], "every layer in manifest must still exist as a blob: %s", path)
+	}
+
+	postStat, err := os.Stat(dst)
+	require.NoError(t, err)
+	t.Logf("real-docker dedup: %d -> %d (ratio %.2fx)",
+		preStat.Size(), postStat.Size(),
+		float64(preStat.Size())/float64(postStat.Size()))
 }
 
 // TestDedupDockerArchive_RefusesUnrecognizedTar guards against accidental

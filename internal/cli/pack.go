@@ -54,7 +54,7 @@ embeds the arch (single-arch) or ends in -multi.oci.tar.gz (multi-arch).`,
 			if version == "" {
 				version = "v0.0.1"
 			}
-			cacheDir := filepath.Join(homeDir(), ".ko", "cache")
+			cacheDir := cacheHome()
 
 			if arch == "all" {
 				return buildMultiArch(cmd, cacheDir, outputDir, version)
@@ -269,4 +269,14 @@ func trimDigest(d string) string {
 		return d[len(p):]
 	}
 	return d
+}
+
+// cacheHome is the per-source download cache. KO_CACHE_HOME overrides the
+// default ~/.ko/cache, useful for test sandboxes that don't want to write
+// into the user's real cache directory.
+func cacheHome() string {
+	if h := os.Getenv("KO_CACHE_HOME"); h != "" {
+		return h
+	}
+	return filepath.Join(homeDir(), ".ko", "cache")
 }
