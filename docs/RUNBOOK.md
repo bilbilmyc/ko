@@ -327,10 +327,33 @@ sudo systemctl start kubelet
 
 ```bash
 ko reset --config cluster.hcl
-# ko 会 ssh 到所有节点跑 kubeadm reset + 清 /etc/kubernetes + 清 /var/lib/etcd
+# 默认行为：在每台节点上：
+#   - systemctl stop kubelet / containerd / docker / etcd
+#   - kubeadm reset --force（同时清 ctr 容器）
+#   - rm -rf /etc/kubernetes /var/lib/{kubelet,etcd,kube-vip}
+#   - rm ko-installed systemd units（etcd / ko-etcd-backup / containerd）
+#   - rm -rf /etc/cni/net.d /opt/cni/bin /var/lib/cni
+#   - flush iptables (filter/nat/mangle/raw) + ipvsadm --clear
+#   - delete cni0 / flannel.1 / cilium-* / kube-ipvs0 / veth* interfaces
+#   - lazy unmount overlay + kubelet pod volume mounts
+#   - rm ko-written config: /etc/containerd/config.toml, /etc/docker/daemon.json
+#   - external etcd 模式：先 uninstall 全部 member + 备份目录
+# 默认会保留镜像缓存 — back-to-back init 不需要 re-pull
+
+# 完全清干净（dev/debug 反复 init/reset 用）：
+ko reset --config cluster.hcl --purge
+# --purge 在默认基础上额外清：
+#   - ctr -n k8s.io containers delete --force --all
+#   - rm -rf /var/lib/containerd /var/run/containerd
+#   - rm -rf /var/lib/docker /var/run/docker
+#   - rm -rf /var/lib/ko /root/.ko
+# 留下 /usr/local/bin/{etcd,etcdctl,containerd,kubelet,kubeadm,kubectl} 等已安装二进制
+# （这些不是 ko 唯一的所有物，可能跟其他 workload 共享）
 ```
 
 reset 是不可逆的——执行前确认 etcd 已经备份。
+
+**幂等性**：reset 脚本里所有清理命令都带 `|| true` 或 `2>/dev/null || true`，在从未 init 过的节点上跑也是 no-op。在调试循环里反复 init/reset 不会留下脏数据。
 
 ## 7. 常见故障
 

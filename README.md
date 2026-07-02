@@ -132,7 +132,7 @@ ko init   --config [master]        初始化集群（在线 / 离线）
 ko init   --generate-config=PROF   生成 starter 配置（sealos 风格，单机/HA/外部 etcd）
 ko node   list|add|remove|label    节点生命周期
 ko tune   apply|show|reset         主机调优（profile 化）
-ko reset                          释放集群
+ko reset [--purge]                释放集群（--purge 额外清镜像缓存和 ko 配置文件）
 ko cluster info|certs|backup|restore 集群操作（备份 / 恢复 etcd / 查证书）
 ko etcd   install|status|backup|uninstall  外部 etcd 生命周期（S14）
 ko pack   build|inspect            离线 OCI bundle（支持 --arch all）

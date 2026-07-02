@@ -7,6 +7,9 @@ ko 的所有重要变更都会记在这里。格式基于 [Keep a Changelog](htt
 
 ### Added
 
+- **`ko reset --purge` 强化清理** — 默认 reset 在原 `kubeadm reset` 基础上额外清理:`/etc/cni/net.d`、`/opt/cni/bin`、`/var/lib/cni`、CNI / Cilium / kube-ipvs0 / veth* 接口、所有 iptables 表（filter/nat/mangle/raw）、overlay + kubelet pod volume 挂载、`/etc/systemd/system/{etcd,ko-etcd-backup,containerd}.service`、`/var/lib/etcd`(per-member) / `/etc/etcd` / `/var/backups/etcd`、`/etc/containerd/config.toml`、`/etc/docker/daemon.json`、kubelet drop-in;`--purge` 进一步清空 `/var/lib/{containerd,docker,ko}`、`/root/.ko`、ctr k8s.io 容器;external etcd 模式自动先调 `UninstallExternalEtcd`
+- **`Teardown.ResetAllWithConfig(cfg)`** — 新的入口,按 `cfg.Etcd.Mode` 自动决定是否先卸外部 etcd
+- **`Teardown.Purge` 字段** — 控制 `--purge` 行为
 - **`ko cluster restore`** — 从 snapshot 恢复 etcd,支持 stacked + external 两种模式; external 模式按 member 顺序 stop etcd → move data dir aside → scp snapshot → etcdctl snapshot restore → start,stacked 模式先停所有 master 的 kubelet 再按 master 顺序 restore 最后启回
 - **`ko cluster backup`** 扩展支持 external etcd 模式(按 member 顺序各做一次 snapshot 并 scp 回本地)
 - **`etcd.Service.InitialCluster()`** 导出,restore 时构造 `--initial-cluster`

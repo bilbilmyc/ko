@@ -17,18 +17,34 @@ import (
 )
 
 func newResetCmd() *cobra.Command {
-	var force bool
+	var force, purge bool
 	cmd := &cobra.Command{
 		Use:   "reset",
-		Short: "Tear down the cluster (kubeadm reset + cleanup on every node)",
+		Short: "Tear down the cluster (kubeadm reset + full cleanup on every node)",
+		Long: `Tear down a ko-deployed cluster.
+
+By default this:
+  - runs kubeadm reset on every host
+  - cleans kubelet / etcd / CNI configs / iptables / veth interfaces /
+    ko-installed systemd units
+  - uninstalls external etcd (when in external mode)
+  - leaves the image cache + ko config files in place so a back-to-back
+    "ko init" is fast
+
+With --purge it also wipes the image cache, containerd state, and any
+ko-written config files — leaving the host as if ko had never run on it
+(useful for dev/debug cycles that need a fully clean re-init).`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, ex, masters, workers, closer, err := loadClusterContext(cmd)
+			cfg, ex, _, _, closer, err := loadClusterContext(cmd)
 			if err != nil {
 				return err
 			}
 			defer closer()
 			if !force {
 				cmd.Println("WARNING: this will wipe all kubernetes state on every node.")
+				if purge {
+					cmd.Println("  --purge: image cache + containerd state will also be nuked.")
+				}
 				cmd.Print("Type 'yes' to continue: ")
 				var confirm string
 				fmt.Scanln(&confirm)
@@ -40,15 +56,17 @@ func newResetCmd() *cobra.Command {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 			defer cancel()
 			td := cluster.NewTeardown(ex)
-			if err := td.ResetAll(ctx, masters, workers); err != nil {
+			td.Purge = purge
+			if err := td.ResetAllWithConfig(ctx, cfg); err != nil {
 				return err
 			}
-			cmd.Printf("✓ cluster reset on %d master(s) and %d worker(s)\n", len(masters), len(workers))
-			_ = cfg
+			cmd.Printf("✓ cluster reset on %d master(s) and %d worker(s) (purge=%t)\n",
+				len(cfg.Nodes.Masters), len(cfg.Nodes.Workers), purge)
 			return nil
 		},
 	}
 	cmd.Flags().BoolVarP(&force, "force", "f", false, "skip confirmation prompt")
+	cmd.Flags().BoolVar(&purge, "purge", false, "also nuke image cache + containerd state + ko config files")
 	return cmd
 }
 
