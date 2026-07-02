@@ -5,6 +5,19 @@ ko 的所有重要变更都会记在这里。格式基于 [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Added — S17 真实离线（in-cluster registry + 镜像仓库自举）
+
+v0.0.1 的 bundle 只烤了 containerd；S17 让 bundle 里同时含 `kubeadm` 二进制、`k8s 1.32` 控制面镜像、`registry:2` 镜像、`cilium 1.16` chart、cilium 全部镜像；`ko init --offline` 会在 master-1 起一个 in-cluster Docker distribution registry，把这些镜像 re-tag 后 push 进去，然后配置 containerd 把 `quay.io` / `registry.k8s.io` / `docker.io` / `ghcr.io` 全部 mirror 到 `ko.local:5000`；kubeadm / cilium / node join 都通过 `--image-repository=ko.local:5000`（或 containerd mirror 自动 rewrite）从本地仓库拉，**完全不再访问公网**。
+
+- **`OfflineRunner`**（`internal/cluster/offline.go`）：scp bundle 到 master-1 → 按 mediaType 拆 layer → 解包 containerd + kubeadm → `ctr -n=k8s.io images import` 拉 k8s/registry/cilium 镜像 → `nerdctl run registry:2 --net=host` 起仓库（带 30s readiness probe）→ retag + `ctr push --plain-http` 把每个镜像推到 `ko.local:5000/<repo>` → 把 `<master-1-IP> ko.local` 写入每个节点 `/etc/hosts`（幂等：`grep -qF` 守卫）
+- **`image.MediaTypeKo{RegistryImage,KubeadmBinary,CiliumImagesTar}`** — 3 个新自定义 mediaType，让 bundle 里每类 artifact 自带类型
+- **`image.K8sImagesForVersion(v, arch)`** / **`image.CiliumImagesForVersion(v)`** — 固化 k8s 1.32（kube-apiserver/controller-manager/scheduler/proxy、coredns、pause、etcd）+ cilium 1.16（cilium/operator-generic/hubble-relay/hubble-ui/hubble-ui-backend/certgen）两套完整镜像清单
+- **`image.ImagePuller`** — nerdctl 优先、docker 兜底；让 cilium images tar 的烤包可复现
+- **`Init.imageRepositoryOverride`** — offline 模式下 kubeadm init / join 都从 `ko.local:5000` 拉镜像（不再走 `cfg.Image.Registry` / `cfg.Image.Repository`）
+- **containerd mirror config** — `[plugins."io.containerd.grpc.v1.cri".registry.mirrors."<host>"]` + `insecure_skip_verify = true`，自动重写所有 upstream 拉取到本地 registry
+
+新增 17 个测试（`internal/cluster/offline_test.go` 11 个 + `internal/image/upstream_test.go` 6 个），全绿。bundle 体积从 v0.0.1 的 68M → 281M，跨架构内容可寻址去重后实际增量更小。
+
 ## [v0.0.1] — 2026-07-02
 
 首个可用版本（v0.0.1）。范围：单机 init、HA 多 master、节点生命周期、主机调优、集群操作、离线 OCI bundle、Doctor 预检、Web Dashboard、多架构、外部 etcd、cluster restore、reset --purge、dashboard 硬化。

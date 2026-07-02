@@ -6,8 +6,8 @@ Kubernetes 集群生命周期管理工具，对标 [sealos](https://github.com/l
 
 ## 特点
 
-- **离线优先**：所有组件打成一个 OCI 大镜像包，断网环境也能装
-- **多架构**：amd64 + arm64，一个 image index 自动选
+- **真离线（S17）**：bundle 含 containerd + kubeadm + k8s 镜像 + cilium 镜像 + registry 镜像本身；init 时 master-1 自举 in-cluster registry（`ko.local:5000`），所有 kubeadm / cilium / node join 都从本地仓库拉，**全程不访问公网**
+- **多架构**：amd64 + arm64，一个 image index 自动选；bundle 内跨架构层做内容可寻址去重
 - **双运行时**：上游 containerd v2 + docker 可切
 - **CNI 双轨**：Cilium（默认，kube-proxy 替换）+ Flannel（兜底）
 - **HA 自带**：kube-vip 自动管 VIP，多 master 集群开箱即用
@@ -16,7 +16,7 @@ Kubernetes 集群生命周期管理工具，对标 [sealos](https://github.com/l
 - **主机调优**：sysctl / 内核模块 / swap / systemd 一键应用，profile 化
 - **Web Dashboard**：basic auth + token bucket 限流 + 审计日志，REST API 看集群 / 加节点 / 调优 / 查证书
 - **Doctor 预检**：kernel / swap / runtime / 端口 / 镜像加速器
-- **etcd 备份**：`ko cluster backup` 一键 snapshot
+- **etcd 备份/恢复**：`ko cluster backup` 一键 snapshot；`ko cluster restore` 支持 stacked + external 两种模式
 
 ## 不做什么（明确边界）
 
@@ -73,16 +73,22 @@ ko doctor --config cluster.hcl
 ko init --config cluster.hcl
 ```
 
-### 离线安装
+### 离线安装（真离线 — bundle 含所有镜像 + 自举 in-cluster registry）
 
 ```bash
 # 1. 在能上网的机器上打包（自动同时构建 amd64 + arm64）
+#    bundle 含 containerd + kubeadm 二进制 + k8s 控制面镜像 + registry:2
+#    仓库镜像本身 + cilium 全部镜像 + cilium helm chart
 ko pack build --arch all --output ./dist --version v0.0.1
-# 产物：dist/ko-v0.0.1-multi.oci.tar.gz
+# 产物：dist/ko-v0.0.1-multi.oci.tar.gz  (~280MB)
 
 # 2. 把 ko 二进制 + bundle 拷到目标机器后离线 init
+#    master-1 会自举 ko.local:5000 镜像仓库；
+#    kubeadm / cilium / node join 全部从本地仓库拉，全程不访问公网
 ko init --config cluster.hcl --offline --bundle ./ko-v0.0.1-multi.oci.tar.gz
 ```
+
+完整流程和故障排查见 [RUNBOOK §2 离线部署](docs/RUNBOOK.md#2-离线部署s17真离线--in-cluster-registry)。
 
 ### HA 集群
 
@@ -171,8 +177,9 @@ docs/                       SPEC / PLAN / CHANGELOG
 | 版本 | 状态 | 目标 |
 |---|---|---|
 | v0.0.1 | ✅ 已发布（2026-07-02） | 首个可用版：init / node / tune / reset / dashboard + 离线大镜像包 + amd64+arm64 + 外部 etcd + restore + reset --purge + dashboard 硬化 |
+| v0.0.x | 📋 S17 真离线已合入 | bundle 含 registry/kubeadm/k8s-images/cilium-images；in-cluster registry + containerd mirror rewrite（下一 release 重打完整 bundle） |
 | v0.1.x | 📋 候选 | HA 外部 etcd / 切换到用户魔改 containerd / eBPF 自动检测 / SSO |
-| v0.2+ | 待定 | 看 v0.0.1 反馈决定 |
+| v0.2+ | 待定 | 看 v0.0.x 反馈决定 |
 
 ## License
 

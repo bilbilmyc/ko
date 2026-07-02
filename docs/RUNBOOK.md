@@ -113,44 +113,115 @@ ko cluster certs --config cluster.hcl
 sudo kubeadm init phase certs all --certificate-validity=876000h
 ```
 
-## 2. 离线部署
+## 2. 离线部署（S17：真离线 — in-cluster registry）
 
-### 2.1 在能上网的机器上打包
+S17 之后，离线部署才真的"全离线"：bundle 里同时烤了 `containerd` / `kubeadm` 二进制 / `k8s 控制面` 镜像（apiserver / controller-manager / scheduler / proxy / coredns / pause / etcd）/ `cilium` 全部镜像 / `registry:2` 仓库镜像本身 / `cilium` helm chart。`ko init --offline` 会在 master-1 拉起一个 in-cluster Docker distribution registry，把这些镜像 re-tag 进去，然后通过 containerd mirror config 自动把所有 upstream 拉取重写到本地。**整个 init 流程不再访问公网**。
 
-```bash
-# 一次同时构建 amd64 + arm64，输出 -multi.oci.tar.gz
-ko pack build --arch all --output ./dist --version v0.0.1
+### 2.1 bundle 里到底有什么
 
-# 产物：
-#   dist/ko-v0.0.1-multi.oci.tar.gz  ← 多架构 bundle
+```
+dist/ko-v0.0.1-multi.oci.tar.gz        # multi-arch OCI image layout
+├─ index.json                          # 顶层：2 个 arch manifest
+├─ oci-layout
+└─ blobs/sha256/
+   ├─ <amd64 manifest>
+   │   ├─ containerd-2.0.5-linux-amd64.tar.gz
+   │   ├─ kubeadm-v1.32.0-linux-amd64.tar.gz   ← kubeadm/kubelet/kubectl 静态二进制
+   │   ├─ k8s-1.32.0-amd64.tar                 ← kube-apiserver/controller-manager/
+   │   │                                        scheduler/proxy/coredns/pause/etcd
+   │   ├─ registry-2-linux-amd64.tar           ← registry:2 仓库镜像本身
+   │   ├─ cilium-1.16.1-images.tar             ← cilium/operator/hubble/...
+   │   └─ cilium-1.16.1.tgz                    ← helm chart
+   └─ <arm64 manifest>                          （chart/k8s-images/registry 跨架构去重）
 ```
 
-### 2.2 拷贝到目标机器
+每层都是独立 mediaType（`vnd.ko.layer.*`），operator 用 `ko pack inspect <bundle>` 看。
+
+### 2.2 在能上网的机器上打包
 
 ```bash
-# 二进制 + bundle + cluster.hcl
+ko pack build --arch all --output ./dist --version v0.0.1
+# 产物：dist/ko-v0.0.1-multi.oci.tar.gz  (约 280MB)
+```
+
+如果只想给一种架构烤：
+
+```bash
+ko pack build --arch amd64 --output ./dist --version v0.0.1
+```
+
+### 2.3 拷贝到目标机器
+
+```bash
 scp bin/ko-linux-amd64 dist/ko-v0.0.1-multi.oci.tar.gz cluster.hcl root@10.0.0.11:
 ```
 
-### 2.3 离线 init
+### 2.4 离线 init
 
 ```bash
 ssh root@10.0.0.11
 ./ko init --config cluster.hcl --offline --bundle ./ko-v0.0.1-multi.oci.tar.gz
 ```
 
-`--offline` 让 ko：
-- 不再访问外网（github release / apt 源 / helm repo）
-- 直接从 bundle 导入 containerd / docker / helm chart / k8s 镜像
-- `--bundle` 指定 bundle 路径，不指定则默认 `~/.ko/bundles/`
+`--offline` 让 ko 走 `OfflineRunner`（`internal/cluster/offline.go`），流程：
 
-### 2.4 增量更新 bundle
+1. **scp + 解包**：bundle 传到 master-1 的 `/tmp/ko-bundle.oci.tar.gz`，解到 `/var/lib/ko/bundle/`
+2. **按 mediaType 找各 layer**：从 `index.json` → manifest → `blobs/sha256/<digest>` 一路定位 `containerd` / `kubeadm` / `k8s-images` / `registry-image` / `cilium-images` / `cilium-chart`
+3. **装 runtime + kubeadm**：解 containerd 到 `/usr/local`，解 kubeadm 后 `install -m 0755 /usr/local/bin/kubeadm`，`systemctl enable --now containerd`
+4. **写 containerd mirror**：给 `quay.io` / `registry.k8s.io` / `docker.io` / `ghcr.io` 各加一个 `registry.mirrors."<host>"` 指向 `http://ko.local:5000`；`ko.local:5000` 自己标 `insecure_skip_verify = true`
+5. **`ctr -n=k8s.io images import`** 拉 k8s-images / registry-image / cilium-images 进 host containerd
+6. **起 in-cluster registry**：`nerdctl run -d --name ko-registry --net=host --restart=always -v /var/lib/ko-registry:/var/lib/registry registry:2`，`curl /v2/` 轮询 30s 确认就绪
+7. **retag + push**：每个镜像 `ctr -n=k8s.io images tag <upstream> ko.local:5000/<repo>` + `ctr -n=k8s.io images push --plain-http ko.local:5000 <target>`
+8. **写 hosts**：解析 master-1 的 `ip -4 -o addr show`，把 `<master-1-IP> ko.local` 写到每个 master + worker 的 `/etc/hosts`（幂等：`grep -qF` 守卫）
+
+然后回到正常 init 流程：
+- kubeadm init 时 `--image-repository=ko.local:5000`，所有控制面镜像从本地拉
+- kubeadm join 时同样 `--image-repository=ko.local:5000`
+- Cilium 走 helm install，image 通过 containerd mirror 自动 rewrite 到本地
+
+整个 init 期间 master-1 不会向 `quay.io` / `registry.k8s.io` / `docker.io` / `ghcr.io` 发任何请求。
+
+### 2.5 验证真的离线了
+
+init 完后，到 master-1 上：
+
+```bash
+# 1. registry 起来了
+curl -sS http://ko.local:5000/v2/_catalog
+# {"repositories":["cilium/cilium","cilium/certgen",...,"coredns/coredns",...]}
+
+# 2. kubeadm 拉镜像从本地走（不应有公网 IP 出现）
+crictl images | grep ko.local:5000
+# ko.local:5000/coredns/coredns       v1.11.3
+# ko.local:5000/etcd                  3.5.16-0
+# ...
+
+# 3. 每个节点的 /etc/hosts 都有 ko.local
+for h in m1 m2 m3 w1 w2; do ssh $h "grep ko.local /etc/hosts"; done
+# 10.0.0.11 ko.local
+```
+
+### 2.6 HA 集群的 ko.local 解析
+
+master-1 IP 写入 hosts 是早期 init 用的；HA 集群 kube-vip 绑定 VIP 后，可选地把所有节点的 `ko.local` 解析从 master-1 IP 改成 VIP，让 master-1 故障时其他 master 也能拉镜像：
+
+```bash
+# 把 m1 上的 10.0.0.11 ko.local 改成 <VIP> ko.local
+ssh <VIP-node> 'sed -i "s/^.* ko.local$/<VIP> ko.local/" /etc/hosts'
+for h in m2 m3 w1 w2; do ssh $h 'sed -i "s/^.* ko.local$/<VIP> ko.local/" /etc/hosts'; done
+```
+
+这一步是可选的——`ko.local:5000` 通过 master-1 IP 在 init 期间已经 work，VIP 切换只是给后续 `ko node add` / `ko cluster backup` 兜底。
+
+### 2.7 增量更新 bundle
 
 bundle 是不可变的（每个 bundle 一个 OCI digest）。新版本重打：
 
 ```bash
 ko pack build --arch all --output ./dist --version v0.0.2
 ```
+
+bundle 跨架构会做内容可寻址去重（cilium chart / k8s-images / registry 三个 layer 在 amd64+arm64 之间 sha256 完全相同），所以只升一个架构的 patch 时实际增量大都来自架构特定的 binary。
 
 ## 3. 节点扩缩容
 

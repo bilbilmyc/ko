@@ -319,10 +319,11 @@
 - [x] S8 完：doctor 全绿
 - [x] S9 完：Dashboard 完成 install/node/tune/release/logs 主流程
 - [x] S10 完：amd64 + arm64 e2e 都过
-- [ ] S11 完：v0.0.1 release tag 推送，CI release 流水线跑通
+- [x] S11 完：v0.0.1 release tag 推送，CI release 流水线跑通
 - [x] S14 完：外部 etcd + mTLS + systemd + 8h 备份 全部跑通
 - [x] S15 完：`ko cluster restore` (stacked + external) 跑通 — `c41ebba`
 - [x] S16 完：`ko reset --purge` 深度清理 — `860f98d`
+- [x] S17 完：真实离线 — bundle 含 registry/kubeadm/k8s-images/cilium-images；master-1 自举 in-cluster registry + containerd mirror rewrite + `ko.local` host 解析
 
 **v0.0.1 发布门**：S1–S11 + S14 全过 + SPEC §8 全部勾选。
 S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合入 Unreleased。
@@ -331,7 +332,7 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 
 ## 8. 当前状态 + 下一项
 
-> 实时状态：所有 S 切片除 S11（release tag）外全过。
+> 实时状态：v0.0.1 已发布；S17 真实离线（in-cluster registry）已完成代码 + 测试 + 文档，下一版 release 重打完整 bundle。
 > 下面"下一项"按"可单 session 落地 + 不需新基础设施"挑。
 
 ### 8.1 已合入 Unreleased
@@ -344,18 +345,21 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 | `ed50f66` | Dashboard 加固（rate limit + audit log，`golang.org/x/time/rate`） |
 | `888e076` | CI 修复：arm64 job 装 `binfmt-support` |
 | `500731e` | release.yml 修复：files glob 匹配 `dist/*.oci.tar.gz` |
+| `S17` | **真实离线** — bundle 加 registry/kubeadm/k8s-images/cilium-images layers；`OfflineRunner` 在 master-1 自举 in-cluster registry；containerd mirror rewrite + `ko.local` hosts 解析；kubeadm init/join 全走 `--image-repository=ko.local:5000` |
 
-**v0.0.1 已发布** — tag 指向 `500731e`，release 产物：`ko-linux-amd64` / `ko-linux-arm64` / `ko-v0.0.1-multi.oci.tar.gz`
+**v0.0.1 已发布** — tag 指向 `500731e`，release 产物：`ko-linux-amd64` / `ko-linux-arm64` / `ko-v0.0.1-multi.oci.tar.gz`（**注意**：v0.0.1 的 bundle 只含 containerd，真离线能力随 S17 发布；S17 之后会重打一个含完整镜像的 bundle tag）
 
 ### 8.2 v0.0.1 收尾 P0（必须）
 
 - [ ] **真集群 E2E**（依赖 kind / kvm，CI 跑或本地物理机）
 - [x] **Dashboard auth 加固**（rate limit + audit log，`golang.org/x/time/rate`）
 - [x] **打 v0.0.1 tag + 触发 release workflow**（`S11` 收尾）
+- [x] **S17 真实离线**（bundle 含所有镜像 + in-cluster registry）
 
 ### 8.3 v0.1.x 候选（按"用户最痛"排）
 
 - **Registry mirror 默认配置（sealos 风格）** — `image` 块加 `registry_mirrors` 默认值；离线 bundle 烤入 mirror index
+- **重打含 registry/k8s-images 的 v0.0.1 bundle tag**（S17 已经把内容准备好，但 v0.0.1 release asset 还是只有 containerd；release drafter 下个 tag 会重新跑）
 - **`--log-format=json`** — 让 dashboard / journal 都能 grep
 - **secrets 加解密**（SSH password 走 HCL 现在是明文）
 - **真集群 E2E**（kind / kvm）
@@ -378,6 +382,8 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 - **Cilium kube-proxy 替换 strict**：`internal/cluster/init.go` 默认，`needsFlannel()` 兜底降级
 - **stacked vs external etcd**：`etcd.mode` 切换；external 模式走 `internal/cluster/etcd_external.go` 全套 mTLS
 - **离线 bundle 自定义 mediaType**：`application/vnd.ko.layer.*.v1`，不能直接 `docker load`
+- **S17 in-cluster registry**：`ko.local:5000`（master-1 IP 写每节点 `/etc/hosts`）；`OfflineRunner` 起 `nerdctl run registry:2 --net=host`；kubeadm init/join 都用 `--image-repository=ko.local:5000` 绕开公网
+- **containerd mirror 自动 rewrite**：`[plugins."io.containerd.grpc.v1.cri".registry.mirrors."quay.io"]` 等四个 upstream 全部 mirror 到 `http://ko.local:5000`；`insecure_skip_verify = true`（无 TLS，内网）
 - **exec 包独立**（`internal/exec/`）：断 `cluster ← containerd/docker` 的 import cycle
 - **dashboard 默认 127.0.0.1:8080**：要监听 0.0.0.0 必须显式 `--listen`，生产加 nginx + TLS（RUNBOOK §5.2）
 
