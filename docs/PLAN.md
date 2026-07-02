@@ -332,10 +332,32 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 
 ## 8. 当前状态 + 下一项
 
-> 实时状态：v0.0.4 已发布（dedup 函数按内容 sha256 去重，三个版本 amd64 bundle 都 826M——CI runner storage driver 自己就 dedup 了）。v0.0.3 / v0.0.4 是防御性 patch：换 storage driver / runner / nerdctl 版本时是兜底防线。用户确认大小无所谓。
-> 下面"下一项"按"可单 session 落地 + 不需新基础设施"挑。
+> 实时状态：v0.0.4 已发布。**当前主线 = 快速部署验证**（单节点 / 多节点集群能不能 5 分钟内 ready），SPEC §8 success criteria 第一条就是 "3 master + 3 worker 5 分钟内完成"——这条从未在真集群上跑过实测。
 
-### 8.1 已合入 Unreleased
+### 8.1 当前主线 P0：快速部署验证
+
+> 目标：证明 `ko init` / `ko node add/remove` 在单节点（1m0w）和多节点（3mNw / 3m3w）拓扑上端到端可用，并实测部署耗时。结果回填到 SPEC §8 + RUNBOOK。
+
+**子任务**（按推进顺序，每条独立可验证）：
+
+- [ ] **(a) kind 单 master 跑通** — kind 起 1 节点 cluster（容器内跑 kubeadm），`ko init --config single.hcl` 走完，`kubectl get nodes` Ready。**基线**。
+- [ ] **(b) kind 1m + 1w 跑通** — 加 1 个 worker 容器，`ko node add` 走通，`kubectl get nodes` 两台 Ready。
+- [ ] **(c) kind 1m + 3w 跑通** — SPEC §8 "一次 add ≥ 5 worker" 简化为先 3 worker 验证，5+ 留到真集群。
+- [ ] **(d) kind HA 3m + 3w 跑通** — 3 master 容器 + 3 worker 容器；kube-vip 切主验证；`kubectl get nodes` 6 台 Ready。
+- [ ] **(e) 实测耗时 + 瓶颈** — 每个拓扑记录 init 端到端耗时（不含 pack），输出到 RUNBOOK §1；识别瓶颈（image pull / kubeadm phases / CNI ready）。
+- [ ] **(f) 加 / 删节点耗时** — `ko node add worker` / `ko node remove <name>` 实测。
+- [ ] **(g) CI 集成 kind e2e** — `.github/workflows/ci.yml` 加 `e2e-kind` job，daily 跑（或 PR 触发），失败直接红。**这是真集群 E2E 的最低成本实现**。
+- [ ] **(h) 真集群一次（可选）** — 用户/团队在物理机或 libvirt 上跑一次 3m3w，结果归档到 RUNBOOK §1.1。
+
+**完成门**：
+- (a)–(e) 全绿 → 把实测耗时填进 SPEC §8 success criteria 第 1 条 + RUNBOOK §1
+- (g) 全绿 → v0.1.x 的"快速部署"门槛正式落地；CI 每日回归
+- (h) 跑了 → 把经验 / 坑写进 RUNBOOK §1.1
+
+**SPEC §8 success criteria 第一条要改的措辞**（实测后回填）：
+> `ko init` 在 3 master + 3 worker 拓扑上 5 分钟内完成（kind 实测 XX 分钟；真机 XX 分钟）
+
+### 8.2 已合入 Unreleased
 
 | Commit | 内容 |
 |---|---|
@@ -348,6 +370,7 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 | `2dd91ce` | S17 真实离线（代码） — bundle 加 registry/kubeadm/k8s-images/cilium-images layers；`OfflineRunner` 在 master-1 自举 in-cluster registry；containerd mirror rewrite + `ko.local` hosts 解析 |
 | `991214f` | S17 真实离线（文档） — CHANGELOG Unreleased + PLAN §8 + RUNBOOK §2 + README |
 | `bundle dedup` | `cliPuller.Save` 自己 dedup docker-archive（v0.0.3 / v0.0.4 内容 sha256 路径去重；当前 CI runner storage driver 自己 dedup，patch 是兜底防线） |
+| `620185f` | docs: 修正 v0.0.3 / v0.0.4 bundle dedup 描述（doc-only，未 push） |
 
 **v0.0.1 已发布** — tag 指向 `500731e`，release 产物：`ko-linux-amd64` / `ko-linux-arm64` / `ko-v0.0.1-multi.oci.tar.gz`（**注意**：v0.0.1 的 bundle 只含 containerd，真离线能力随 S17 发布）
 
@@ -357,26 +380,26 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 
 **v0.0.4 已发布** — dedup 改用内容 sha256 而非文件路径，更稳健（amd64 bundle 仍 826M；用户确认大小无所谓）
 
-### 8.2 v0.0.1 收尾 P0（必须）
+### 8.3 v0.0.1 收尾 P0（必须）
 
-- [ ] **真集群 E2E**（依赖 kind / kvm，CI 跑或本地物理机）
+- [ ] **真集群 E2E** = §8.1 (g)/(h) 两条；其余功能已发 v0.0.4
 - [x] **Dashboard auth 加固**（rate limit + audit log，`golang.org/x/time/rate`）
 - [x] **打 v0.0.1 tag + 触发 release workflow**（`S11` 收尾）
 - [x] **S17 真实离线**（bundle 含所有镜像 + in-cluster registry）
 
-### 8.3 v0.1.x 候选（按"用户最痛"排）
+### 8.4 v0.1.x 候选（按"用户最痛"排）
 
+- **secrets 加解密**（SSH password 走 HCL 现在是明文）— 安全硬伤，先做
 - **Registry mirror 默认配置（sealos 风格）** — `image` 块加 `registry_mirrors` 默认值；离线 bundle 烤入 mirror index
-- **重打含 registry/k8s-images 的 v0.0.1 bundle tag**（S17 已经把内容准备好，但 v0.0.1 release asset 还是只有 containerd；release drafter 下个 tag 会重新跑）
 - **`--log-format=json`** — 让 dashboard / journal 都能 grep
-- **secrets 加解密**（SSH password 走 HCL 现在是明文）
-- **真集群 E2E**（kind / kvm）
+- **节点增删 WebSocket 实时推送** — dashboard UX 升级
 - **Dashboard 真前端**（Vite + Vue/React — SPEC 提的是 React，团队熟 Vue 待确认）
 - **`ko upgrade`**（SPEC 明确 v0.0.x 不做，v0.1.x 切）
 - **Prometheus `/metrics`** + structlog
 - **IPv6 single-stack / dual-stack**
+- **eBPF 自动检测 / 节点级 runtime/arch/cni UI 化**（SPEC §8 v0.1.x）
 
-### 8.4 不做（明确边界）
+### 8.5 不做（明确边界）
 
 - App store / ClusterApp
 - 集群内升级（v0.0.x 范围外，v0.1.x 起）
@@ -384,7 +407,7 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 - 多集群联邦
 - 集群迁移
 
-### 8.5 代码 / 决策锚点（防止后续 session 想"为什么这么写"）
+### 8.6 代码 / 决策锚点（防止后续 session 想"为什么这么写"）
 
 - **证书 100 年**：`internal/cluster/kubeadm.go` 的 `CertificateValidity = 876000h`，kubeadm init + join 都强制
 - **Cilium kube-proxy 替换 strict**：`internal/cluster/init.go` 默认，`needsFlannel()` 兜底降级
