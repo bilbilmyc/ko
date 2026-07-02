@@ -14,10 +14,16 @@ import (
 // mockExecutor is a tiny test double that records commands and serves
 // canned responses keyed by the command's first token.
 type mockExecutor struct {
-	RunFn   func(ctx context.Context, host, command string) exec.Result
-	ScpFn   func(ctx context.Context, host, src, dst string) error
-	closed  bool
-	history []string
+	RunFn      func(ctx context.Context, host, command string) exec.Result
+	ScpFn      func(ctx context.Context, host, src, dst string) error
+	closed     bool
+	history    []string
+	scpHistory []scpCall
+}
+
+type scpCall struct {
+	Src string
+	Dst string
 }
 
 func (m *mockExecutor) Run(_ context.Context, host, command string) exec.Result {
@@ -29,6 +35,7 @@ func (m *mockExecutor) Run(_ context.Context, host, command string) exec.Result 
 }
 
 func (m *mockExecutor) Scp(_ context.Context, host, src, dst string) error {
+	m.scpHistory = append(m.scpHistory, scpCall{Src: src, Dst: dst})
 	if m.ScpFn != nil {
 		return m.ScpFn(context.Background(), host, src, dst)
 	}

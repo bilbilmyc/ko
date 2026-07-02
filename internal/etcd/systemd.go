@@ -96,6 +96,12 @@ func NewService(ex exec.Executor, tarball, version string, cc ClusterConfig) *Se
 // initialClusterList builds the --initial-cluster string. Members are
 // sorted by name to keep the list deterministic.
 func (s *Service) initialClusterList() string {
+	return s.InitialCluster()
+}
+
+// InitialCluster is the exported form of the --initial-cluster string,
+// useful for restore commands that need the same value at run time.
+func (s *Service) InitialCluster() string {
 	members := append([]Member(nil), s.Cluster.Members...)
 	sort.Slice(members, func(i, j int) bool { return members[i].Name < members[j].Name })
 	var b bytes.Buffer

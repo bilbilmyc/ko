@@ -1,8 +1,10 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -17,6 +19,9 @@ import (
 type Teardown struct {
 	Exec Executor
 	CRI  string // default "unix:///run/containerd/containerd.sock"
+	// RestoreAPITimeout bounds the apiserver /healthz probe in
+	// RestoreStackedEtcd. Zero means the default (90s).
+	RestoreAPITimeout time.Duration
 }
 
 func NewTeardown(exec Executor) *Teardown {
@@ -85,6 +90,116 @@ ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
 	}
 	logger.Info("snapshot saved", "local", localPath)
 	return localPath, nil
+}
+
+// RestoreStackedOpts describes a stacked-mode restore from a single snapshot
+// file distributed across every master. Each master gets its own etcd
+// instance (as a static pod), so we restore on every master in turn.
+type RestoreStackedOpts struct {
+	SnapshotPath string   // local snapshot file
+	Masters      []string // master IPs in user-specified order
+}
+
+// RestoreStackedEtcd restores etcd on every master from one snapshot file.
+// Order of operations:
+//  1. Validate snapshot exists.
+//  2. Discover each master's etcd member name (= `hostname -s` — kubeadm's
+//     convention for the static pod).
+//  3. Stop kubelet on every master first so the static pod can't restart
+//     etcd while we're working on the data dir.
+//  4. Per master (sequential): move /var/lib/etcd aside, scp snapshot,
+//     etcdctl snapshot restore with --name=<host> --initial-cluster=...
+//     --initial-advertise-peer-urls=https://<ip>:2380.
+//  5. Start kubelet on every master.
+//  6. Poll apiserver /healthz on the first master.
+func (t *Teardown) RestoreStackedEtcd(ctx context.Context, opts RestoreStackedOpts) error {
+	if opts.SnapshotPath == "" {
+		return fmt.Errorf("snapshot path required")
+	}
+	if _, err := os.Stat(opts.SnapshotPath); err != nil {
+		return fmt.Errorf("snapshot %q: %w", opts.SnapshotPath, err)
+	}
+	if len(opts.Masters) == 0 {
+		return fmt.Errorf("at least one master required")
+	}
+
+	names := make([]string, len(opts.Masters))
+	for i, m := range opts.Masters {
+		r := t.Exec.Run(ctx, m, "hostname -s")
+		if r.Failed() {
+			return fmt.Errorf("%s: hostname: %w", m, r.Err)
+		}
+		names[i] = strings.TrimSpace(string(r.Stdout))
+	}
+	var ic strings.Builder
+	for i, m := range opts.Masters {
+		if i > 0 {
+			ic.WriteByte(',')
+		}
+		fmt.Fprintf(&ic, "%s=https://%s:2380", names[i], m)
+	}
+	initialCluster := ic.String()
+	ts := time.Now().UTC().Format("20060102-150405")
+	logger.Info("etcd stacked restore: starting", "masters", len(opts.Masters), "snapshot", opts.SnapshotPath)
+
+	for _, m := range opts.Masters {
+		r := t.Exec.Run(ctx, m, "systemctl stop kubelet 2>/dev/null || true")
+		if r.Failed() {
+			return fmt.Errorf("%s: stop kubelet: %w", m, r.Err)
+		}
+	}
+	logger.Info("etcd stacked restore: kubelet stopped on all masters")
+
+	for i, m := range opts.Masters {
+		name := names[i]
+		remoteSnap := fmt.Sprintf("/tmp/ko-etcd-restore-%s.db", ts)
+		if err := t.Exec.Scp(ctx, m, opts.SnapshotPath, remoteSnap); err != nil {
+			return fmt.Errorf("%s: scp snapshot: %w", m, err)
+		}
+		mv := fmt.Sprintf(`test -e /var/lib/etcd && mv /var/lib/etcd /var/lib/etcd.broken-%s || true`, ts)
+		if r := t.Exec.Run(ctx, m, mv); r.Failed() {
+			return fmt.Errorf("%s: move data-dir: %w", m, r.Err)
+		}
+		restore := fmt.Sprintf(`set -euo pipefail
+ETCDCTL_API=3 etcdctl snapshot restore %s \
+  --name=%s \
+  --initial-cluster=%s \
+  --initial-advertise-peer-urls=https://%s:2380 \
+  --data-dir=/var/lib/etcd
+chmod 0700 /var/lib/etcd
+`, remoteSnap, name, initialCluster, m)
+		if r := t.Exec.Run(ctx, m, restore); r.Failed() {
+			return fmt.Errorf("%s: etcdctl snapshot restore: %w", m, r.Err)
+		}
+		_ = t.Exec.Run(ctx, m, fmt.Sprintf("rm -f %s", remoteSnap))
+		logger.Info("etcd stacked restore: data dir restored", "master", m, "name", name)
+	}
+
+	for _, m := range opts.Masters {
+		if r := t.Exec.Run(ctx, m, "systemctl start kubelet"); r.Failed() {
+			return fmt.Errorf("%s: start kubelet: %w", m, r.Err)
+		}
+	}
+	logger.Info("etcd stacked restore: kubelet started on all masters")
+
+	return t.waitForStackedAPI(ctx, opts.Masters[0])
+}
+
+func (t *Teardown) waitForStackedAPI(ctx context.Context, master string) error {
+	timeout := t.RestoreAPITimeout
+	if timeout == 0 {
+		timeout = 90 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		r := t.Exec.Run(ctx, master, "curl -sk --max-time 3 https://127.0.0.1:6443/healthz 2>/dev/null")
+		if !r.Failed() && bytes.Contains(r.Stdout, []byte("ok")) {
+			logger.Info("etcd stacked restore: apiserver healthy", "master", master)
+			return nil
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return fmt.Errorf("apiserver on %s did not return healthy within %s after restore", master, timeout)
 }
 
 // CertificateInfo holds expiry metadata for one cert file.

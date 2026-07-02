@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -26,6 +25,9 @@ type BackupService struct {
 	BackupDir  string // default /var/backups/etcd
 	RetainDays int    // default 14
 	Interval   string // OnCalendar spec, default "*-*-* *:00/8:00"  (every 8h, on the hour)
+	// RestoreHealthTimeout bounds the post-restore /health probe on the
+	// restored member. Zero means the default (30s).
+	RestoreHealthTimeout time.Duration
 }
 
 func NewBackupService(ex exec.Executor) *BackupService {
@@ -133,6 +135,128 @@ chmod 0600 %s
 	}
 	logger.Info("etcd snapshot saved", "host", host, "name", memberName, "local", local)
 	return local, nil
+}
+
+// RestoreOptions describes one member's restore from a snapshot file.
+// SnapshotPath is the LOCAL path; we scp it onto the member host. The
+// InitialCluster string must include every member of the cluster, in
+// `name=peerURL` format, comma-separated.
+type RestoreOptions struct {
+	Member         Member
+	SnapshotPath   string // local snapshot file
+	InitialCluster string // "m1=https://10.0.0.31:2380,m2=..."
+}
+
+// Restore puts a single member back from a snapshot. Steps:
+//  1. validate the snapshot file is readable locally
+//  2. stop etcd.service on the member
+//  3. move current data-dir to .broken-<ts> (so an operator can recover)
+//  4. scp snapshot to /tmp on the host
+//  5. etcdctl snapshot restore into a fresh data-dir
+//  6. start etcd.service
+//  7. wait for /health to come back
+//
+// Caller is expected to restore all members of the cluster in sequence —
+// etcd 3.5 requires the full --initial-cluster list on every restore, but
+// only one member is up at a time during this operation (we restart each
+// in isolation).
+func (b *BackupService) Restore(ctx context.Context, opts RestoreOptions) error {
+	if opts.SnapshotPath == "" {
+		return fmt.Errorf("snapshot path required")
+	}
+	if _, err := os.Stat(opts.SnapshotPath); err != nil {
+		return fmt.Errorf("snapshot %q: %w", opts.SnapshotPath, err)
+	}
+	if opts.Member.Name == "" {
+		return fmt.Errorf("member name required")
+	}
+	if opts.Member.Host == "" {
+		return fmt.Errorf("member host required")
+	}
+	if opts.Member.DataDir == "" {
+		opts.Member.DataDir = "/var/lib/etcd/" + opts.Member.Name
+	}
+	if opts.Member.InitialPeerURLs == "" {
+		opts.Member.InitialPeerURLs = fmt.Sprintf("https://%s:2380", opts.Member.Host)
+	}
+	if opts.InitialCluster == "" {
+		return fmt.Errorf("--initial-cluster required (run from a config-aware caller)")
+	}
+
+	host := opts.Member.Host
+	ts := time.Now().UTC().Format("20060102-150405")
+	logger.Info("etcd restore: starting", "host", host, "name", opts.Member.Name, "snapshot", opts.SnapshotPath)
+
+	// 1. Stop etcd.service. Idempotent — already-stopped returns non-zero, which we tolerate.
+	if r := b.Exec.Run(ctx, host, "systemctl stop etcd.service 2>/dev/null || true"); r.Failed() {
+		return fmt.Errorf("stop etcd: %w", r.Err)
+	}
+
+	// 2. Move the existing data-dir aside. If nothing is there yet (fresh
+	//    member), the mv fails — tolerate.
+	mv := fmt.Sprintf("test -e %s && mv %s %s.broken-%s || true", opts.Member.DataDir, opts.Member.DataDir, opts.Member.DataDir, ts)
+	if r := b.Exec.Run(ctx, host, mv); r.Failed() {
+		return fmt.Errorf("move data-dir aside: %w", r.Err)
+	}
+
+	// 3. Fresh data-dir.
+	if r := b.Exec.Run(ctx, host, fmt.Sprintf("mkdir -p %s", opts.Member.DataDir)); r.Failed() {
+		return fmt.Errorf("mkdir data-dir: %w", r.Err)
+	}
+
+	// 4. scp snapshot onto the host.
+	remoteSnap := fmt.Sprintf("/tmp/ko-etcd-restore-%s.db", ts)
+	if err := b.Exec.Scp(ctx, host, opts.SnapshotPath, remoteSnap); err != nil {
+		return fmt.Errorf("scp snapshot: %w", err)
+	}
+
+	// 5. Run etcdctl snapshot restore. Use the on-host etcdctl (installed
+	//    alongside etcd by Service.Install).
+	restore := fmt.Sprintf(`set -euo pipefail
+ETCDCTL_API=3 /usr/local/bin/etcdctl snapshot restore %s \
+  --name=%s \
+  --initial-cluster=%s \
+  --initial-advertise-peer-urls=%s \
+  --data-dir=%s
+chmod 0700 %s
+`,
+		remoteSnap,
+		opts.Member.Name,
+		opts.InitialCluster,
+		opts.Member.InitialPeerURLs,
+		opts.Member.DataDir,
+		opts.Member.DataDir,
+	)
+	if r := b.Exec.Run(ctx, host, restore); r.Failed() {
+		return fmt.Errorf("etcdctl snapshot restore: %w", r.Err)
+	}
+
+	// 6. Clean up the staged snapshot file.
+	_ = b.Exec.Run(ctx, host, fmt.Sprintf("rm -f %s", remoteSnap))
+
+	// 7. Start etcd.service.
+	if r := b.Exec.Run(ctx, host, "systemctl start etcd.service"); r.Failed() {
+		return fmt.Errorf("start etcd: %w", r.Err)
+	}
+
+	// 8. Wait for /health (up to ~30s, generous because of WAL replay on cold start).
+	healthTimeout := b.RestoreHealthTimeout
+	if healthTimeout == 0 {
+		healthTimeout = 30 * time.Second
+	}
+	deadline := time.Now().Add(healthTimeout)
+	for time.Now().Before(deadline) {
+		probe := fmt.Sprintf(
+			`curl -sk --max-time 3 --cacert %s/ca.crt --cert %s/client.crt --key %s/client.key https://127.0.0.1:2379/health 2>/dev/null`,
+			b.PKIDir, b.PKIDir, b.PKIDir)
+		r := b.Exec.Run(ctx, host, probe)
+		if !r.Failed() && bytes.Contains(r.Stdout, []byte(`"health":"true"`)) {
+			logger.Info("etcd restore: healthy", "host", host, "name", opts.Member.Name)
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("etcd on %s did not become healthy within %s after restore", host, healthTimeout)
 }
 
 // BackupInfo describes one snapshot on the host.
@@ -270,5 +394,3 @@ func parseHumanInterval(spec string) string {
 }
 
 // ensure imports of bytes / filepath stay for the package's other files
-var _ = bytes.NewBuffer
-var _ = filepath.Join

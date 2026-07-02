@@ -292,7 +292,20 @@ ko cluster backup --config cluster.hcl --output ./etcd-snap-$(date +%Y%m%d).db
 
 ### 6.2 恢复
 
-ko v0.0.1 不自动 restore（手动用 `etcdctl snapshot restore`）。恢复步骤：
+```bash
+# v0.0.1+：ko cluster restore 自动跑 stacked restore 全流程
+ko cluster restore --snapshot ./ko-etcd-20260701.db --config cluster.hcl
+
+# 流程（用户看到）：
+# 1. 停所有 master 的 kubelet
+# 2. 把每台 master 的 /var/lib/etcd 移到 .broken-<ts> 旁路保留
+# 3. scp snapshot 到每台 master 的 /tmp
+# 4. 在每台 master 上 etcdctl snapshot restore（每台用各自的 --name + 完整的 --initial-cluster）
+# 5. 起所有 master 的 kubelet
+# 6. 等 apiserver /healthz 返回 ok（最多 90s）
+```
+
+如果想走手动流程（老版本或 restore 命令坏了）：
 
 ```bash
 # 1. 停所有 master 上的 kube-apiserver
@@ -473,7 +486,28 @@ GET /api/etcd/backups        # 所有备份文件列表（按 mtime desc）
 落在每台 member 的 `/var/backups/etcd/<host>-<ts>.db`，
 本地保留 14 天滚动。手动 `ko etcd backup` 会把文件 scp 回 `ko` 所在机器当前目录。
 
-恢复时把 db 拷回 etcd 节点，单 member 恢复：
+**单 member 故障**（多数派还活）：直接重启那台 member 就能重新加入 quorum，
+**不需要 restore**——只有全集群故障或数据污染才需要从 snapshot restore。
+
+**从 snapshot restore 全集群**：
+
+```bash
+# v0.0.1+：ko cluster restore 自动按 member 顺序 stop / move aside / restore / start
+ko cluster restore --snapshot ./ko-etcd-etcd-1-20260101-120000.db --config cluster.hcl
+
+# 流程：
+# 1. 对每个 member（按名字排序）：
+#    a. systemctl stop etcd
+#    b. 把 /var/lib/etcd/<member> 移到 .broken-<ts>
+#    c. scp snapshot 到 /tmp
+#    d. etcdctl snapshot restore --name=<member> --initial-cluster=<全部成员>
+#       --initial-advertise-peer-urls=https://<host>:2380 --data-dir=/var/lib/etcd/<member>
+#    e. systemctl start etcd
+#    f. 等 /health=true（最多 30s）
+# 2. 整个恢复过程中不要动 kube-apiserver，让 master 自然发现 etcd 恢复
+```
+
+手动单 member restore（老版本或 `ko cluster restore` 不可用时）：
 
 ```bash
 ssh etcd-1
@@ -487,9 +521,6 @@ sudo mv /var/lib/etcd/etcd-1 /var/lib/etcd/etcd-1.broken
 sudo mv /var/lib/etcd/etcd-1.new /var/lib/etcd/etcd-1
 sudo systemctl start etcd
 ```
-
-集群多数派（3 选 2 活）的情况下，单独重启一台就能让 member 重新加入 quorum；
-全集群故障才需要从 snapshot 恢复。**先打电话给团队再 rm data-dir**。
 
 ### 10.5 证书轮换
 

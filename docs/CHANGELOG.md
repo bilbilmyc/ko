@@ -7,6 +7,9 @@ ko 的所有重要变更都会记在这里。格式基于 [Keep a Changelog](htt
 
 ### Added
 
+- **`ko cluster restore`** — 从 snapshot 恢复 etcd,支持 stacked + external 两种模式; external 模式按 member 顺序 stop etcd → move data dir aside → scp snapshot → etcdctl snapshot restore → start,stacked 模式先停所有 master 的 kubelet 再按 master 顺序 restore 最后启回
+- **`ko cluster backup`** 扩展支持 external etcd 模式(按 member 顺序各做一次 snapshot 并 scp 回本地)
+- **`etcd.Service.InitialCluster()`** 导出,restore 时构造 `--initial-cluster`
 - **S14 外部 etcd** — etcd 3.5.21 作为外部二进制 + systemd unit + mTLS 自签 PKI（ca / server / peer / client）+ 8 小时 systemd timer 备份（14 天滚动）+ dashboard `/api/etcd/{status,backups}` 端点
 - **`ko etcd install|status|backup|uninstall` 命令族**
 - **sealos 风格 `ko init --generate-config=PROFILE`** — profile: `single` / `ha` / `external-etcd`,带嵌入式 HCL 模板 + 注释
