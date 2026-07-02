@@ -57,23 +57,9 @@ make build-all       # 同时构建 amd64 + arm64
 
 ## 快速开始
 
-### 在线安装（默认）
+### 离线安装（推荐 / 默认）
 
-```bash
-# 1. 生成一份 cluster.hcl（sealos 风格：选 profile，写带文档注释的配置）
-#    可选 profile: single | ha | external-etcd
-ko init --generate-config=ha -o cluster.hcl
-
-# 2. 按需编辑 cluster.hcl（已自动 include 每个字段的注释）
-
-# 3. 预检
-ko doctor --config cluster.hcl
-
-# 4. 初始化（先 init 第一个 master，后续会自动 join 其余 master 和 worker）
-ko init --config cluster.hcl
-```
-
-### 离线安装（真离线 — bundle 含所有镜像 + 自举 in-cluster registry）
+> 项目主用场景：公司内部 + 真离线。bundle 含所有镜像 + 自举 in-cluster registry，**全程不访问公网**。
 
 ```bash
 # 1. 在能上网的机器上打包（自动同时构建 amd64 + arm64）
@@ -82,13 +68,35 @@ ko init --config cluster.hcl
 ko pack build --arch all --output ./dist --version v0.0.4
 # 产物：dist/ko-v0.0.4-multi.oci.tar.gz  (~826MB amd64 layer)
 
-# 2. 把 ko 二进制 + bundle 拷到目标机器后离线 init
+# 2. 生成 cluster.hcl（sealos 风格：选 profile，写带文档注释的配置）
+#    可选 profile: single | ha | external-etcd
+ko init --generate-config=ha -o cluster.hcl
+
+# 3. 按需编辑 cluster.hcl（已自动 include 每个字段的注释）
+
+# 4. 预检
+ko doctor --config cluster.hcl
+
+# 5. 把 ko 二进制 + bundle 拷到目标机器后离线 init
 #    master-1 会自举 ko.local:5000 镜像仓库；
 #    kubeadm / cilium / node join 全部从本地仓库拉，全程不访问公网
 ko init --config cluster.hcl --offline --bundle ./ko-v0.0.4-multi.oci.tar.gz
 ```
 
-完整流程和故障排查见 [RUNBOOK §2 离线部署](docs/RUNBOOK.md#2-离线部署s17真离线--in-cluster-registry)。
+完整流程和故障排查见 [RUNBOOK §1 离线部署](docs/RUNBOOK.md#1-离线部署s17真离线--in-cluster-registry)。
+
+### 在线安装（备选 / 不推荐，仅供测试）
+
+```bash
+# 1. 生成 cluster.hcl
+ko init --generate-config=ha -o cluster.hcl
+
+# 2. 预检
+ko doctor --config cluster.hcl
+
+# 3. 初始化（在线模式：所有镜像从公网拉）
+ko init --config cluster.hcl
+```
 
 ### HA 集群
 

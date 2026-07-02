@@ -332,30 +332,37 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 
 ## 8. 当前状态 + 下一项
 
-> 实时状态：v0.0.4 已发布。**当前主线 = 快速部署验证**（单节点 / 多节点集群能不能 5 分钟内 ready），SPEC §8 success criteria 第一条就是 "3 master + 3 worker 5 分钟内完成"——这条从未在真集群上跑过实测。
+> 实时状态：v0.0.4 已发布。**当前主线 = 纯离线快速部署验证**（单节点 / 多节点集群离线 init 5 分钟内 ready）。
+>
+> **关键约束**（2026-07-02 用户确认）：
+> - **纯离线**：摒弃在线模式。SPEC §8 / README / RUNBOOK / PLAN §8.1 都把离线当主线，在线模式作为 fallback 或折叠。
+> - **公司内部使用**：bundle 通过**公司内部存储**分发（非 GitHub release）；交付时 ko 二进制 + bundle tar 一并交付。
+> - **低频大版本升级**：bundle 烤一次用很久；不做极致体积优化；不需要做太多升级自动化。
+>
+> SPEC §8 success criteria 第一条从未在真集群上跑过实测——而且原来写的是"在线"，现在要改成"离线 5 分钟内完成"。
 
-### 8.1 当前主线 P0：快速部署验证
+### 8.1 当前主线 P0：纯离线快速部署验证
 
-> 目标：证明 `ko init` / `ko node add/remove` 在单节点（1m0w）和多节点（3mNw / 3m3w）拓扑上端到端可用，并实测部署耗时。结果回填到 SPEC §8 + RUNBOOK。
+> 目标：证明 `ko init --offline --bundle ...` / `ko node add/remove --offline` 在单节点（1m0w）和多节点（3m3w）拓扑上端到端可用，并实测部署耗时。结果回填到 SPEC §8 + RUNBOOK §1。
 
-**子任务**（按推进顺序，每条独立可验证）：
+**子任务**（按推进顺序，每条独立可验证；**所有场景必须离线**）：
 
-- [ ] **(a) kind 单 master 跑通** — kind 起 1 节点 cluster（容器内跑 kubeadm），`ko init --config single.hcl` 走完，`kubectl get nodes` Ready。**基线**。
-- [ ] **(b) kind 1m + 1w 跑通** — 加 1 个 worker 容器，`ko node add` 走通，`kubectl get nodes` 两台 Ready。
-- [ ] **(c) kind 1m + 3w 跑通** — SPEC §8 "一次 add ≥ 5 worker" 简化为先 3 worker 验证，5+ 留到真集群。
-- [ ] **(d) kind HA 3m + 3w 跑通** — 3 master 容器 + 3 worker 容器；kube-vip 切主验证；`kubectl get nodes` 6 台 Ready。
-- [ ] **(e) 实测耗时 + 瓶颈** — 每个拓扑记录 init 端到端耗时（不含 pack），输出到 RUNBOOK §1；识别瓶颈（image pull / kubeadm phases / CNI ready）。
-- [ ] **(f) 加 / 删节点耗时** — `ko node add worker` / `ko node remove <name>` 实测。
-- [ ] **(g) CI 集成 kind e2e** — `.github/workflows/ci.yml` 加 `e2e-kind` job，daily 跑（或 PR 触发），失败直接红。**这是真集群 E2E 的最低成本实现**。
-- [ ] **(h) 真集群一次（可选）** — 用户/团队在物理机或 libvirt 上跑一次 3m3w，结果归档到 RUNBOOK §1.1。
+- [ ] **(a) kind 单 master 离线 init 跑通** — kind 起 1 节点 cluster，`ko init --offline --bundle ./ko-v0.0.4-amd64.oci.tar.gz` 走完，`kubectl get nodes` Ready。**基线**。
+- [ ] **(b) kind 1m + 1w 离线 add 跑通** — 加 1 个 worker 容器，`ko node add --offline --bundle ... --role worker` 走通，`kubectl get nodes` 两台 Ready。
+- [ ] **(c) kind 1m + 3w 离线 add 跑通** — SPEC §8 "一次 add ≥ 5 worker" 简化为先 3 worker 离线 add 验证，5+ 留到真集群。
+- [ ] **(d) kind HA 3m + 3w 离线跑通** — 3 master 容器 + 3 worker 容器；kube-vip 切主验证；`kubectl get nodes` 6 台 Ready。**SPEC 核心拓扑，全程离线**。
+- [ ] **(e) 实测耗时 + 瓶颈** — 每个拓扑记录离线 init 端到端耗时（不含 pack），输出到 RUNBOOK §1；识别瓶颈（bundle scp / ctr images import / registry ready / kubeadm phases / CNI ready）。
+- [ ] **(f) 加 / 删节点离线耗时** — `ko node add worker` / `ko node remove <name>` 离线实测（含 bundle 重传成本）。
+- [ ] **(g) CI 集成 kind e2e（离线）** — `.github/workflows/ci.yml` 加 `e2e-kind-offline` job，daily 跑（或 PR 触发）。bundle 烤入 job artifact，e2e job 拉 artifact 跑离线 init，失败直接红。**这是真集群 E2E 的最低成本实现**。
+- [ ] **(h) 真集群一次（可选）** — 用户/团队在物理机或 libvirt 上跑一次 3m3w 离线 init，结果归档到 RUNBOOK §1.1。
 
 **完成门**：
 - (a)–(e) 全绿 → 把实测耗时填进 SPEC §8 success criteria 第 1 条 + RUNBOOK §1
-- (g) 全绿 → v0.1.x 的"快速部署"门槛正式落地；CI 每日回归
+- (g) 全绿 → 纯离线快速部署门槛正式落地；CI 每日回归
 - (h) 跑了 → 把经验 / 坑写进 RUNBOOK §1.1
 
 **SPEC §8 success criteria 第一条要改的措辞**（实测后回填）：
-> `ko init` 在 3 master + 3 worker 拓扑上 5 分钟内完成（kind 实测 XX 分钟；真机 XX 分钟）
+> `ko init --offline --bundle <bundle.tar.gz>` 在 3 master + 3 worker 拓扑上 5 分钟内完成（kind 实测 XX 分钟；真机 XX 分钟）
 
 ### 8.2 已合入 Unreleased
 
@@ -402,12 +409,21 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 ### 8.5 不做（明确边界）
 
 - App store / ClusterApp
-- 集群内升级（v0.0.x 范围外，v0.1.x 起）
+- 集群内升级（v0.0.x 范围外，v0.1.x 起；且低频升级优先级更低）
 - Windows / macOS 节点
 - 多集群联邦
 - 集群迁移
+- **公网 / 在线模式相关**：不做在线 init 流程优化；bundle 不上 GitHub release 之外的公网 registry（GitHub release 留给开发自测）
 
-### 8.6 代码 / 决策锚点（防止后续 session 想"为什么这么写"）
+### 8.6 公司内部存储 + 交付物（用户决策待补）
+
+> 用户会做内部存储放 bundle tar 包；交付时 ko 二进制 + bundle tar 一并交付。具体形态未定，先列待决策项。
+
+- [ ] **(i) 内部 bundle 存储形态**（#60）— HTTP 文件服务器 / NFS / MinIO / 自建对象存储 / 别的？决定后 RUNBOOK §2 写明 `ko pack / ko init` 怎么从内部存储拉 bundle；SPEC §6 写 bundle 分发链路。
+- [ ] **(ii) 交付物 tar 包打包方案**（#61）— 合并成一个 tar（`ko-v0.0.4-bundle.tar.gz` 含 ko + bundle + 配置模板），还是分两个 tar（`ko` + `bundle`），或新增 `ko pack ship --output delivery.tar.gz` 命令一键打包？决定后实现 + RUNBOOK §2.8 写明交付物结构。
+- [ ] **(iii) RUNBOOK / README 重排**（#62）— RUNBOOK §1（HA 多 master 在线）和 §2（离线部署）互换次序：§1 离线（主线）、§2 在线（折叠成"备选"小节）。README "快速开始" 同步：离线示例打头。**任务轻量、纯文档**。
+
+### 8.7 代码 / 决策锚点（防止后续 session 想"为什么这么写"）
 
 - **证书 100 年**：`internal/cluster/kubeadm.go` 的 `CertificateValidity = 876000h`，kubeadm init + join 都强制
 - **Cilium kube-proxy 替换 strict**：`internal/cluster/init.go` 默认，`needsFlannel()` 兜底降级

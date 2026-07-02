@@ -19,35 +19,57 @@ ko doctor --config cluster.hcl
 
 如果 doctor 报红，按它的提示修。**不要**绕开 doctor 直接 init。
 
-## 1. HA 多 master 部署
+## 1. 离线部署（主线 / 推荐）
 
-### 1.1 拓扑
+> 项目主用场景：公司内部 + 真离线。bundle 含所有镜像 + 自举 in-cluster registry，**全程不访问公网**。所有 init / node add 默认走离线模式。
 
-最少 3 master（容忍 1 故障），推荐 5 master（容忍 2 故障）。worker 数量按业务规模定。
+S17 之后，离线部署才真的"全离线"：bundle 里同时烤了 `containerd` / `kubeadm` 二进制 / `k8s 控制面` 镜像（apiserver / controller-manager / scheduler / proxy / coredns / pause / etcd）/ `cilium` 全部镜像 / `registry:2` 仓库镜像本身 / `cilium` helm chart。`ko init --offline` 会在 master-1 拉起一个 in-cluster Docker distribution registry，把这些镜像 re-tag 进去，然后通过 containerd mirror config 自动把所有 upstream 拉取重写到本地。
+
+### 1.1 bundle 里到底有什么
 
 ```
-            ┌────────────────────────────────────┐
-            │   kube-vip (DaemonSet, hostPort)   │
-            │       VIP: 10.0.0.10:6443         │
-            └──────┬─────────┬──────────┬────────┘
-                   │         │          │
-              ┌────▼──┐ ┌───▼───┐ ┌───▼───┐
-              │ m1    │ │ m2    │ │ m3    │
-              │ etcd  │ │ etcd  │ │ etcd  │   stacked etcd
-              └───────┘ └───────┘ └───────┘
-                   │         │          │
-              ┌────▼─────────▼──────────▼────┐
-              │           Cilium             │   kubeProxyReplacement=strict
-              └────┬─────────┬──────────┬────┘
-                   │         │          │
-              ┌────▼──┐ ┌───▼───┐ ┌───▼───┐
-              │ w1    │ │ w2    │ │ w3    │
-              └───────┘ └───────┘ └───────┘
+dist/ko-v0.0.4-multi.oci.tar.gz        # multi-arch OCI image layout
+├─ index.json                          # 顶层：2 个 arch manifest
+├─ oci-layout
+└─ blobs/sha256/
+   ├─ <amd64 manifest>
+   │   ├─ containerd-2.0.5-linux-amd64.tar.gz
+   │   ├─ kubeadm-v1.32.0-linux-amd64.tar.gz   ← kubeadm/kubelet/kubectl 静态二进制
+   │   ├─ k8s-1.32.0-amd64.tar                 ← kube-apiserver/controller-manager/
+   │   │                                        scheduler/proxy/coredns/pause/etcd
+   │   ├─ registry-2-linux-amd64.tar           ← registry:2 仓库镜像本身
+   │   ├─ cilium-1.16.1-images.tar             ← cilium/operator/hubble/...
+   │   └─ cilium-1.16.1.tgz                    ← helm chart
+   └─ <arm64 manifest>                          （chart/k8s-images/registry 跨架构去重）
 ```
 
-### 1.2 集群配置
+每层都是独立 mediaType（`vnd.ko.layer.*`），operator 用 `ko pack inspect <bundle>` 看。
 
-`cluster.hcl` 关键字段：
+### 1.2 在能上网的机器上打包
+
+```bash
+ko pack build --arch all --output ./dist --version v0.0.4
+# 产物：dist/ko-v0.0.4-multi.oci.tar.gz  (amd64 bundle ~826M；含 containerd + kubeadm + k8s 控制面镜像 + registry:2 + cilium 全部镜像)
+```
+
+如果只想给一种架构烤：
+
+```bash
+ko pack build --arch amd64 --output ./dist --version v0.0.4
+```
+
+烤好的 bundle 推到**公司内部存储**（HTTP / NFS / MinIO 等 — 待选型，见 PLAN §8.6），交付时与 ko 二进制一起给到目标机器。详细流程见 §2.8 交付物。
+
+### 1.3 cluster.hcl 配置
+
+```bash
+ko init --generate-config=ha -o cluster.hcl
+# 可选 profile: single | ha | external-etcd
+vim cluster.hcl   # 填节点 IP、SSH user、VIP、CNI 等
+ko doctor --config cluster.hcl   # 红就修
+```
+
+关键字段：
 
 ```hcl
 cluster {
@@ -76,87 +98,41 @@ runtime { default = "containerd" }
 cni     { plugin  = "cilium" }
 ```
 
-### 1.3 init 流程
+### 1.4 拓扑（HA：3 master + N worker）
+
+最少 3 master（容忍 1 故障），推荐 5 master（容忍 2 故障）。worker 数量按业务规模定。
+
+```
+            ┌────────────────────────────────────┐
+            │   kube-vip (DaemonSet, hostPort)   │
+            │       VIP: 10.0.0.10:6443         │
+            └──────┬─────────┬──────────┬────────┘
+                   │         │          │
+              ┌────▼──┐ ┌───▼───┐ ┌───▼───┐
+              │ m1    │ │ m2    │ │ m3    │
+              │ etcd  │ │ etcd  │ │ etcd  │   stacked etcd
+              └───────┘ └───────┘ └───────┘
+                   │         │          │
+              ┌────▼─────────▼──────────▼────┐
+              │           Cilium             │   kubeProxyReplacement=strict
+              └────┬─────────┬──────────┬────┘
+                   │         │          │
+              ┌────▼──┐ ┌───▼───┐ ┌───▼───┐
+              │ w1    │ │ w2    │ │ w3    │
+              └───────┘ └───────┘ └───────┘
+```
+
+### 1.5 拷贝交付物到目标机器
 
 ```bash
-ko init --config cluster.hcl
+# 从内部存储拿 bundle
+scp <internal-storage>/ko-v0.0.4-multi.oci.tar.gz .
+
+# 把 ko 二进制 + bundle + cluster.hcl 一起推到 master-1
+scp bin/ko-linux-amd64 ko-v0.0.4-multi.oci.tar.gz cluster.hcl root@10.0.0.11:
 ```
 
-ko 会按顺序：
-1. 在所有节点装 containerd（或 docker）
-2. 装 kubeadm / kubelet / kubectl（apt 源或 yum 源）
-3. 在 m1 上 `kubeadm init` 带 `--certificate-validity=876000h`（100 年）
-4. 在所有节点部署 kube-vip（绑定 VIP）
-5. 在 m2、m3 上 `kubeadm join --control-plane`（自动拷贝 CA）
-6. 在所有 worker 上 `kubeadm join`
-7. 装 Cilium（kubeProxyReplacement=strict）
-
-kubeconfig 落在 `~/.ko/kube/admin.conf`。后续 kubectl 这么用：
-
-```bash
-export KUBECONFIG=~/.ko/kube/admin.conf
-kubectl get nodes
-```
-
-### 1.4 100 年证书
-
-ko 默认 `--certificate-validity=876000h`（100 年）。`ko cluster certs` 能看每个 master 上的证书剩余有效期：
-
-```bash
-ko cluster certs --config cluster.hcl
-```
-
-如果看到某些证书是 1 年有效期，说明那台 master 是 `kubeadm join` 后才签的（默认 join 不覆盖 cert 有效期，需要显式传 `--certificate-validity`）。重签：
-
-```bash
-# 在目标 master 上
-sudo kubeadm init phase certs all --certificate-validity=876000h
-```
-
-## 2. 离线部署（S17：真离线 — in-cluster registry）
-
-S17 之后，离线部署才真的"全离线"：bundle 里同时烤了 `containerd` / `kubeadm` 二进制 / `k8s 控制面` 镜像（apiserver / controller-manager / scheduler / proxy / coredns / pause / etcd）/ `cilium` 全部镜像 / `registry:2` 仓库镜像本身 / `cilium` helm chart。`ko init --offline` 会在 master-1 拉起一个 in-cluster Docker distribution registry，把这些镜像 re-tag 进去，然后通过 containerd mirror config 自动把所有 upstream 拉取重写到本地。**整个 init 流程不再访问公网**。
-
-### 2.1 bundle 里到底有什么
-
-```
-dist/ko-v0.0.1-multi.oci.tar.gz        # multi-arch OCI image layout
-├─ index.json                          # 顶层：2 个 arch manifest
-├─ oci-layout
-└─ blobs/sha256/
-   ├─ <amd64 manifest>
-   │   ├─ containerd-2.0.5-linux-amd64.tar.gz
-   │   ├─ kubeadm-v1.32.0-linux-amd64.tar.gz   ← kubeadm/kubelet/kubectl 静态二进制
-   │   ├─ k8s-1.32.0-amd64.tar                 ← kube-apiserver/controller-manager/
-   │   │                                        scheduler/proxy/coredns/pause/etcd
-   │   ├─ registry-2-linux-amd64.tar           ← registry:2 仓库镜像本身
-   │   ├─ cilium-1.16.1-images.tar             ← cilium/operator/hubble/...
-   │   └─ cilium-1.16.1.tgz                    ← helm chart
-   └─ <arm64 manifest>                          （chart/k8s-images/registry 跨架构去重）
-```
-
-每层都是独立 mediaType（`vnd.ko.layer.*`），operator 用 `ko pack inspect <bundle>` 看。
-
-### 2.2 在能上网的机器上打包
-
-```bash
-ko pack build --arch all --output ./dist --version v0.0.4
-# 产物：dist/ko-v0.0.4-multi.oci.tar.gz  (amd64 bundle ~826M；含 containerd + kubeadm + k8s 控制面镜像 + registry:2 + cilium 全部镜像)
-```
-
-如果只想给一种架构烤：
-
-```bash
-ko pack build --arch amd64 --output ./dist --version v0.0.1
-```
-
-### 2.3 拷贝到目标机器
-
-```bash
-scp bin/ko-linux-amd64 dist/ko-v0.0.4-multi.oci.tar.gz cluster.hcl root@10.0.0.11:
-```
-
-### 2.4 离线 init
+### 1.6 离线 init
 
 ```bash
 ssh root@10.0.0.11
@@ -181,7 +157,7 @@ ssh root@10.0.0.11
 
 整个 init 期间 master-1 不会向 `quay.io` / `registry.k8s.io` / `docker.io` / `ghcr.io` 发任何请求。
 
-### 2.5 验证真的离线了
+### 1.7 验证真的离线了
 
 init 完后，到 master-1 上：
 
@@ -201,7 +177,7 @@ for h in m1 m2 m3 w1 w2; do ssh $h "grep ko.local /etc/hosts"; done
 # 10.0.0.11 ko.local
 ```
 
-### 2.6 HA 集群的 ko.local 解析
+### 1.8 HA 集群的 ko.local 解析（可选）
 
 master-1 IP 写入 hosts 是早期 init 用的；HA 集群 kube-vip 绑定 VIP 后，可选地把所有节点的 `ko.local` 解析从 master-1 IP 改成 VIP，让 master-1 故障时其他 master 也能拉镜像：
 
@@ -213,15 +189,80 @@ for h in m2 m3 w1 w2; do ssh $h 'sed -i "s/^.* ko.local$/<VIP> ko.local/" /etc/h
 
 这一步是可选的——`ko.local:5000` 通过 master-1 IP 在 init 期间已经 work，VIP 切换只是给后续 `ko node add` / `ko cluster backup` 兜底。
 
-### 2.7 增量更新 bundle
+### 1.9 100 年证书
+
+ko 默认 `--certificate-validity=876000h`（100 年）。`ko cluster certs` 能看每个 master 上的证书剩余有效期：
+
+```bash
+ko cluster certs --config cluster.hcl
+```
+
+如果看到某些证书是 1 年有效期，说明那台 master 是 `kubeadm join` 后才签的（默认 join 不覆盖 cert 有效期，需要显式传 `--certificate-validity`）。重签：
+
+```bash
+# 在目标 master 上
+sudo kubeadm init phase certs all --certificate-validity=876000h
+```
+
+### 1.10 增量更新 bundle
 
 bundle 是不可变的（每个 bundle 一个 OCI digest）。新版本重打：
 
 ```bash
-ko pack build --arch all --output ./dist --version v0.0.2
+ko pack build --arch all --output ./dist --version v0.0.5
 ```
 
 bundle 跨架构会做内容可寻址去重（cilium chart / k8s-images / registry 三个 layer 在 amd64+arm64 之间 sha256 完全相同），所以只升一个架构的 patch 时实际增量大都来自架构特定的 binary。
+
+## 2. 在线部署（备选 / 不推荐）
+
+> **本节仅作历史参考和测试用**。项目主用离线模式（§1），ko 团队内部不再优化此路径——所有镜像走公网 registry，无 SLA 保证，无版本锁定。
+
+### 2.1 cluster.hcl 配置
+
+同 §1.3。
+
+### 2.2 init 流程
+
+```bash
+ko init --config cluster.hcl
+```
+
+ko 会按顺序：
+1. 在所有节点装 containerd（或 docker）
+2. 装 kubeadm / kubelet / kubectl（apt 源或 yum 源）
+3. 在 m1 上 `kubeadm init` 带 `--certificate-validity=876000h`（100 年）
+4. 在所有节点部署 kube-vip（绑定 VIP）
+5. 在 m2、m3 上 `kubeadm join --control-plane`（自动拷贝 CA）
+6. 在所有 worker 上 `kubeadm join`
+7. 装 Cilium（kubeProxyReplacement=strict）
+
+kubeconfig 落在 `~/.ko/kube/admin.conf`。后续 kubectl 这么用：
+
+```bash
+export KUBECONFIG=~/.ko/kube/admin.conf
+kubectl get nodes
+```
+
+### 2.3 100 年证书
+
+同 §1.9。
+
+### 2.4 离线模式怎么回退到在线
+
+如果某次离线 init 失败（bundle 损坏 / OCI 解包异常），可以直接重跑但**不**带 `--offline`：
+
+```bash
+# 在所有节点上 systemctl stop kubelet containerd
+ssh m1 'kubeadm reset --force'
+ssh m2 'kubeadm reset --force'
+ssh m3 'kubeadm reset --force'
+
+# 在线 init 一次（拉公网镜像）
+ko init --config cluster.hcl
+```
+
+回退后集群里没 in-cluster registry，kubeadm 拉镜像直接走公网。**生产环境不建议走这条路径**。
 
 ## 3. 节点扩缩容
 
@@ -230,24 +271,34 @@ bundle 跨架构会做内容可寻址去重（cilium chart / k8s-images / regist
 新机器先确保 SSH 可达、kernel ≥ 5.4、swap 关闭。然后：
 
 ```bash
+# 离线模式（项目主用）
+ko node add 10.0.0.24 --role worker --config cluster.hcl --offline --bundle ./ko-v0.0.4-multi.oci.tar.gz
+
+# 在线模式（不推荐）
 ko node add 10.0.0.24 --role worker --config cluster.hcl
 ```
 
 ko 会：
-1. 在新机器装 runtime
-2. 在新机器装 kubeadm/kubelet
-3. `kubeadm join` 到集群
-4. 等 Node Ready 后退出
+1. 把 bundle 推到新机器（仅离线模式）
+2. 在新机器装 runtime（containerd / docker）
+3. 在新机器装 kubeadm/kubelet（离线从 bundle 解，在线从 apt/yum 源）
+4. `kubeadm join --worker` 到集群
+5. kubelet 启动时所有 image 拉取走 containerd mirror → `ko.local:5000`
+6. 等 Node Ready 后退出
 
 ### 3.2 加 master
 
 ```bash
+# 离线模式（项目主用）
+ko node add 10.0.0.14 --role master --config cluster.hcl --offline --bundle ./ko-v0.0.4-multi.oci.tar.gz
+
+# 在线模式（不推荐）
 ko node add 10.0.0.14 --role master --config cluster.hcl
 ```
 
 ko 会：
-1. 装 runtime + kubeadm
-2. `kubeadm join --control-plane`（自动拷贝 CA + 签 100 年证书）
+1. 装 runtime + kubeadm（同 §3.1）
+2. `kubeadm join --control-plane`（自动从 m1 拷 CA + 签 100 年证书）
 3. 自动更新 VIP 的 endpoints（如果 VIP 是 LB 后端模式）
 
 **注意**：加 master 必须满足奇数台（etcd 多数派），别加第 4 台 master 后再加第 6 台。
