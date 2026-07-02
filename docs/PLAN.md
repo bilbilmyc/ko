@@ -342,16 +342,16 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 | `c41ebba` | S15 `ko cluster restore`（stacked + external） |
 | `860f98d` | S16 `ko reset --purge` 深度清理 |
 | `ed50f66` | Dashboard 加固（rate limit + audit log，`golang.org/x/time/rate`） |
+| `888e076` | CI 修复：arm64 job 装 `binfmt-support` |
+| `500731e` | release.yml 修复：files glob 匹配 `dist/*.oci.tar.gz` |
+
+**v0.0.1 已发布** — tag 指向 `500731e`，release 产物：`ko-linux-amd64` / `ko-linux-arm64` / `ko-v0.0.1-multi.oci.tar.gz`
 
 ### 8.2 v0.0.1 收尾 P0（必须）
 
 - [ ] **真集群 E2E**（依赖 kind / kvm，CI 跑或本地物理机）
 - [x] **Dashboard auth 加固**（rate limit + audit log，`golang.org/x/time/rate`）
-  - 中间件链 `recoverer → audit → rateLimit → basicAuth → mux`
-  - 审计记录所有响应（200 / 401 user=`-` / 429 / 500）；rate limit 默认 1 req/s burst 20 全局共享；`--rate-limit=0` 关闭
-  - 失败降级：audit 文件打不开 → `io.Discard` + log；写失败仅 log 不阻塞
-- [ ] **打 v0.0.1 tag + 触发 release workflow**（`S11` 收尾）
-  - `git tag v0.0.1 && git push origin v0.0.1` → 跑通 ci + release
+- [x] **打 v0.0.1 tag + 触发 release workflow**（`S11` 收尾）
 
 ### 8.3 v0.1.x 候选（按"用户最痛"排）
 

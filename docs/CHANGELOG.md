@@ -5,6 +5,10 @@ ko 的所有重要变更都会记在这里。格式基于 [Keep a Changelog](htt
 
 ## [Unreleased]
 
+## [v0.0.1] — 2026-07-02
+
+首个可用版本（v0.0.1）。范围：单机 init、HA 多 master、节点生命周期、主机调优、集群操作、离线 OCI bundle、Doctor 预检、Web Dashboard、多架构、外部 etcd、cluster restore、reset --purge、dashboard 硬化。
+
 ### Added
 
 - **Dashboard 速率限制 + 审计日志** — `golang.org/x/time/rate` token bucket（默认 1 req/s, burst 20）挡在 basicAuth 前；`/var/log/ko/dashboard-audit.log`（mode 0600，append-only）记录所有请求（200 / 401 / 429 / 500），字段：RFC3339Nano remote user method path status bytes dur；新增 `--rate-limit` / `--rate-burst` / `--audit-log` flag，审计失败降级到 `io.Discard` 不阻塞请求
@@ -19,10 +23,6 @@ ko 的所有重要变更都会记在这里。格式基于 [Keep a Changelog](htt
 - **sealos 风格 `ko init --generate-config=PROFILE`** — profile: `single` / `ha` / `external-etcd`,带嵌入式 HCL 模板 + 注释
 - **race-mode CI 修复** — `internal/cluster/local_exec.go` 缓冲区在 `cmd.Run()` 之后读取,`TestLocalExecutor_PropagatesExitError` 改用 `sh -c 'echo ... >&2; exit 1'`
 - **Go 1.25.5 锁版本** — `go.mod` 1.26.4,CI/release workflow 用 1.25.5,`helm.sh/helm/v3` 锁 v3.21.0（v3.21.x 系列里最后一个不要求 Go 1.26 的版本）
-
-## [v0.0.1] — 2026-07
-
-首个可用版本（v0.0.1）。范围：单机 init、HA 多 master、节点生命周期、主机调优、集群操作、离线 OCI bundle、Doctor 预检、Web Dashboard、多架构支持。
 
 ### Added
 

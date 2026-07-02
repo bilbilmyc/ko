@@ -2,7 +2,7 @@
 
 Kubernetes 集群生命周期管理工具，对标 [sealos](https://github.com/labring/sealos)，**离线优先**。
 
-> 当前状态：**v0.0.1 开发中**（首个可用版）。规格见 [`docs/SPEC.md`](docs/SPEC.md)，实施计划见 [`docs/PLAN.md`](docs/PLAN.md)。
+> 当前状态：**v0.0.1 已发布**（[release](https://github.com/bilbilmyc/ko/releases/tag/v0.0.1)）。规格见 [`docs/SPEC.md`](docs/SPEC.md)，实施计划见 [`docs/PLAN.md`](docs/PLAN.md)。
 
 ## 特点
 
@@ -168,11 +168,11 @@ docs/                       SPEC / PLAN / CHANGELOG
 
 ## 路线图
 
-| 版本 | 目标 |
-|---|---|
-| v0.0.1 | 首个可用版：init / node / tune / reset / dashboard + 离线大镜像包 + amd64+arm64 |
-| v0.1.x | HA 外部 etcd / 切换到用户魔改 containerd / eBPF 自动检测 / SSO |
-| v0.2+ | 看 v0.0.1 反馈决定 |
+| 版本 | 状态 | 目标 |
+|---|---|---|
+| v0.0.1 | ✅ 已发布（2026-07-02） | 首个可用版：init / node / tune / reset / dashboard + 离线大镜像包 + amd64+arm64 + 外部 etcd + restore + reset --purge + dashboard 硬化 |
+| v0.1.x | 📋 候选 | HA 外部 etcd / 切换到用户魔改 containerd / eBPF 自动检测 / SSO |
+| v0.2+ | 待定 | 看 v0.0.1 反馈决定 |
 
 ## License
 
