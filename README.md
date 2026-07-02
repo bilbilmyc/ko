@@ -2,7 +2,7 @@
 
 Kubernetes 集群生命周期管理工具，对标 [sealos](https://github.com/labring/sealos)，**离线优先**。
 
-> 当前状态：**v0.0.3 已发布**（[release](https://github.com/bilbilmyc/ko/releases/tag/v0.0.3)）。规格见 [`docs/SPEC.md`](docs/SPEC.md)，实施计划见 [`docs/PLAN.md`](docs/PLAN.md)。
+> 当前状态：**v0.0.4 已发布**（[release](https://github.com/bilbilmyc/ko/releases/tag/v0.0.4)）。规格见 [`docs/SPEC.md`](docs/SPEC.md)，实施计划见 [`docs/PLAN.md`](docs/PLAN.md)。
 
 ## 特点
 
@@ -79,13 +79,13 @@ ko init --config cluster.hcl
 # 1. 在能上网的机器上打包（自动同时构建 amd64 + arm64）
 #    bundle 含 containerd + kubeadm 二进制 + k8s 控制面镜像 + registry:2
 #    仓库镜像本身 + cilium 全部镜像 + cilium helm chart
-ko pack build --arch all --output ./dist --version v0.0.1
-# 产物：dist/ko-v0.0.1-multi.oci.tar.gz  (~280MB)
+ko pack build --arch all --output ./dist --version v0.0.4
+# 产物：dist/ko-v0.0.4-multi.oci.tar.gz  (~826MB amd64 layer)
 
 # 2. 把 ko 二进制 + bundle 拷到目标机器后离线 init
 #    master-1 会自举 ko.local:5000 镜像仓库；
 #    kubeadm / cilium / node join 全部从本地仓库拉，全程不访问公网
-ko init --config cluster.hcl --offline --bundle ./ko-v0.0.1-multi.oci.tar.gz
+ko init --config cluster.hcl --offline --bundle ./ko-v0.0.4-multi.oci.tar.gz
 ```
 
 完整流程和故障排查见 [RUNBOOK §2 离线部署](docs/RUNBOOK.md#2-离线部署s17真离线--in-cluster-registry)。
@@ -176,8 +176,9 @@ docs/                       SPEC / PLAN / CHANGELOG
 
 | 版本 | 状态 | 目标 |
 |---|---|---|
-| v0.0.3 | ✅ 已发布（2026-07-02） | **真离线 + bundle dedup** — S17 自举 in-cluster registry；cliPuller.Save 自己 dedup docker-archive；bundle 826M → ~280M |
-| v0.0.2 | 📦 历史 release | 真离线 release，但 bundle 没 dedup（826M），**改用 v0.0.3** |
+| v0.0.4 | ✅ 已发布（2026-07-02） | dedup 改按 blob 内容 sha256（更稳健） |
+| v0.0.3 | ✅ 已发布（2026-07-02） | bundle dedup 防御性 patch（`dedupDockerArchive`；当前 CI 是 no-op） |
+| v0.0.2 | ✅ 已发布（2026-07-02） | **真离线** — S17 自举 in-cluster registry；bundle 含 containerd/kubeadm/k8s-images/cilium-images |
 | v0.0.1 | 📦 历史 release | 首个可用版（bundle 仅含 containerd） |
 | v0.1.x | 📋 候选 | HA 外部 etcd / 切换到用户魔改 containerd / eBPF 自动检测 / SSO |
 | v0.2+ | 待定 | 看 v0.0.x 反馈决定 |

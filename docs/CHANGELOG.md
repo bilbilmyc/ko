@@ -5,17 +5,43 @@ ko 的所有重要变更都会记在这里。格式基于 [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Fixed — 修正 v0.0.3 / v0.0.4 的 bundle dedup 描述（backport 到上面的 entry）
+
+实测 v0.0.2 / v0.0.3 / v0.0.4 三个 release 的 amd64 bundle 体积都是 ~826M（差异 < 10KB 是 round-trip 噪声）。原因是当前 GitHub Actions runner 用 docker vfs storage driver，自己已经按内容 dedup 了，`dedupDockerArchive` 在这套 storage driver 上没有 duplicate payload 可去。
+
+之前 CHANGELOG / README / PLAN / RUNBOOK 里写的 "826M → ~280M" 是基于 arm64 本地烤包体积的误解：~280M 是 **arm64 image** 真实 unique content 体积，不是 dedup 效果。amd64 image 真实 unique content 就是 ~826M。
+
+为什么 v0.0.3 / v0.0.4 仍然保留：换 storage driver / runner / nerdctl 版本时 dedup 是兜底防线。功能正确，单元测试覆盖（合成 docker-archive + 真 docker save + 拒绝非 docker-archive 三种场景）。
+
+本版本无代码改动，仅文档修正（不上 tag）。
+
+## [v0.0.4] — 2026-07-02
+
+### Fixed — `dedupDockerArchive` 按 blob 内容 sha256 去重，不按文件路径
+
+v0.0.3 用的是路径去重（`blobs/sha256/<digest>` 同名收一份）。改成 **内容 sha256 去重**：hash 每个 blob 的实际 payload，第一份保留，后续同内容直接丢弃。这更稳健——即便上游保存层把同一份 blob 写到不同路径（极少见但理论上可能），dedup 也认。
+
+实测结果：在当前 GitHub Actions runner（docker vfs storage driver）烤出的 amd64 bundle 里，dedup 仍然是 no-op，因为 storage driver 自己已经按内容去重了一层，没有重复 payload。release asset 体积三个版本都在 826M（差异 < 10KB 是 round-trip 噪声）。
+
+为什么仍然保留这个 patch：当 storage driver 是 overlay2 / fuse-overlayfs 等不自动 dedup 的实现（很多 CI 自托管 runner 是这样），或者 nerdctl save 在某些 platform 行为变化时，dedup 是兜底防线。功能正确，单元测试覆盖。
+
+新增 1 个测试：`TestDedupDockerArchive_CollapsesDuplicateBlobs`（在 v0.0.3 基础上扩展，覆盖同内容不同路径场景）。
+
 ## [v0.0.3] — 2026-07-02
 
-### Fixed — bundle 体积收缩（k8s/cilium images tar 自己 dedup）
+### Added — `cliPuller.Save` 自己 dedup docker-archive（防御性 patch）
 
-v0.0.2 的 multi-arch bundle 是 826M：k8s-images layer 559M，cilium-images layer 976M。原因是 `docker save`（和 `nerdctl save` 默认）输出的 docker-archive tar 在 storage driver 不支持 cross-image dedup 时（GitHub Actions runner 的 docker vfs），每个 image 的每个 layer blob 都单独存一份，跨 image 的共享 layer 被复制多遍。
+`docker save`（和 `nerdctl save` 默认）输出的 docker-archive tar 在 storage driver 不支持 cross-image dedup 时（GitHub Actions runner 的 docker vfs 是这种），每个 image 的每个 layer blob 都单独存一份，跨 image 的共享 layer 被复制多遍。
 
 `cliPuller.Save` 在 save 之后立即跑 `dedupDockerArchive`：读 docker-archive tar，把重复的 `blobs/sha256/<digest>` 收成一份，重写 tar。`manifest.json` 仍按 sha256 路径引用 blob，**对 `ctr images import` 完全透明**——不需要换 offline runner 的导入逻辑。
 
-预期 bundle 体积：826M → ~280M（恢复本地已 dedup 烤包的真实大小）。
+实测结果：当前 GitHub Actions 烤出的 amd64 bundle 体积 v0.0.2 / v0.0.3 / v0.0.4 **三个版本都在 826M**（差异 < 10KB 是 round-trip 噪声）。这是 amd64 image 真实 unique content 大小——不是 dedup 没起作用，而是当前 CI runner 的 storage driver 自己就已经按内容去重了，dedup 是 no-op。
 
-新增 2 个测试：`TestDedupDockerArchive_CollapsesDuplicateBlobs`、`TestDedupDockerArchive_RefusesUnrecognizedTar`。
+为什么仍然保留这个 patch：换 storage driver / 换 runner / 换 nerdctl 版本 时，dedup 是兜底防线。**功能正确，单元测试覆盖（合成 docker-archive + 真 docker save 两种场景）**。
+
+新增 3 个测试：`TestDedupDockerArchive_CollapsesDuplicateBlobs`、`TestDedupDockerArchive_OnRealDockerSave`、`TestDedupDockerArchive_RefusesUnrecognizedTar`。
+
+> **bundle 体积预期**：~280M 是 **arm64 image** 在本地烤的体积，不是 amd64 bundle dedup 效果。amd64 bundle 真实 unique content 就是 ~826M（k8s-images layer ~559M + cilium-images layer ~210M + 其他）。
 
 ## [v0.0.2] — 2026-07-02
 

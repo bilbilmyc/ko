@@ -140,8 +140,8 @@ dist/ko-v0.0.1-multi.oci.tar.gz        # multi-arch OCI image layout
 ### 2.2 在能上网的机器上打包
 
 ```bash
-ko pack build --arch all --output ./dist --version v0.0.1
-# 产物：dist/ko-v0.0.1-multi.oci.tar.gz  (约 280MB)
+ko pack build --arch all --output ./dist --version v0.0.4
+# 产物：dist/ko-v0.0.4-multi.oci.tar.gz  (amd64 bundle ~826M；含 containerd + kubeadm + k8s 控制面镜像 + registry:2 + cilium 全部镜像)
 ```
 
 如果只想给一种架构烤：
@@ -153,14 +153,14 @@ ko pack build --arch amd64 --output ./dist --version v0.0.1
 ### 2.3 拷贝到目标机器
 
 ```bash
-scp bin/ko-linux-amd64 dist/ko-v0.0.1-multi.oci.tar.gz cluster.hcl root@10.0.0.11:
+scp bin/ko-linux-amd64 dist/ko-v0.0.4-multi.oci.tar.gz cluster.hcl root@10.0.0.11:
 ```
 
 ### 2.4 离线 init
 
 ```bash
 ssh root@10.0.0.11
-./ko init --config cluster.hcl --offline --bundle ./ko-v0.0.1-multi.oci.tar.gz
+./ko init --config cluster.hcl --offline --bundle ./ko-v0.0.4-multi.oci.tar.gz
 ```
 
 `--offline` 让 ko 走 `OfflineRunner`（`internal/cluster/offline.go`），流程：
@@ -501,7 +501,7 @@ cni { plugin = "flannel" }
 ### 7.4 离线 init 找不到镜像
 
 ```bash
-ko init --config cluster.hcl --offline --bundle ./ko-v0.0.1-multi.oci.tar.gz
+ko init --config cluster.hcl --offline --bundle ./ko-v0.0.4-multi.oci.tar.gz
 ```
 
 `--bundle` 必须是 multi-arch bundle 或与目标机器 arch 匹配的 single-arch bundle。`ko pack inspect <bundle>` 看 bundle 的 arches。
