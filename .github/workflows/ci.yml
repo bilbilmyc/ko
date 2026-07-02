@@ -46,7 +46,9 @@ jobs:
       - name: install qemu + binfmt
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-user-static
+          # binfmt-support ships `update-binfmts`; without it qemu-aarch64
+          # binaries fail with "exec format error" on the runner.
+          sudo apt-get install -y qemu-user-static binfmt-support
           sudo update-binfmts --enable qemu-aarch64
 
       - name: go test (cross)
