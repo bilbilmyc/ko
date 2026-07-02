@@ -110,6 +110,9 @@ func (k *Kubeadm) Join(ctx context.Context, host string, opts KubeadmOptions) (R
 		"--discovery-token-ca-cert-hash=" + opts.DiscoveryTokenCAHash,
 		"--skip-phases=addon/kube-proxy",
 	}
+	if opts.ImageRepository != "" {
+		args = append(args, "--image-repository="+opts.ImageRepository)
+	}
 	if opts.ControlPlane {
 		if opts.APIServerEndpoint == "" {
 			return Result{}, fmt.Errorf("control-plane join requires APIServerEndpoint")

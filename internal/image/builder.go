@@ -20,12 +20,15 @@ import (
 
 // Media types ko uses for its bundle layers.
 const (
-	MediaTypeKoBundle        = "application/vnd.ko.bundle.v1+json"
-	MediaTypeKoContainerdTar = "application/vnd.ko.layer.containerd.tar.gzip.v1"
-	MediaTypeKoDockerDeb     = "application/vnd.ko.layer.docker.deb.v1"
-	MediaTypeKoDockerRPM     = "application/vnd.ko.layer.docker.rpm.v1"
-	MediaTypeKoHelmChart     = "application/vnd.ko.layer.helm.chart.tgz.v1"
-	MediaTypeKoK8sImagesTar  = "application/vnd.ko.layer.k8s.images.tar.v1"
+	MediaTypeKoBundle         = "application/vnd.ko.bundle.v1+json"
+	MediaTypeKoContainerdTar  = "application/vnd.ko.layer.containerd.tar.gzip.v1"
+	MediaTypeKoDockerDeb      = "application/vnd.ko.layer.docker.deb.v1"
+	MediaTypeKoDockerRPM      = "application/vnd.ko.layer.docker.rpm.v1"
+	MediaTypeKoHelmChart      = "application/vnd.ko.layer.helm.chart.tgz.v1"
+	MediaTypeKoK8sImagesTar   = "application/vnd.ko.layer.k8s.images.tar.v1"
+	MediaTypeKoCiliumImagesTar = "application/vnd.ko.layer.cilium.images.tar.v1"
+	MediaTypeKoRegistryImage  = "application/vnd.ko.layer.registry.image.v1+docker.archive"
+	MediaTypeKoKubeadmBinary  = "application/vnd.ko.layer.kubeadm.binary.v1+tar.gz"
 
 	MediaTypeOCIImageIndex   = "application/vnd.oci.image.index.v1+json"
 	MediaTypeOCIManifest     = "application/vnd.oci.image.manifest.v1+json"

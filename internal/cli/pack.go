@@ -117,11 +117,18 @@ func buildMultiArch(cmd *cobra.Command, cacheDir, outputDir, version string) err
 	return nil
 }
 
-// gatherLayers fetches containerd + helm charts for a single arch. Errors
-// fetching a single source are downgraded to warnings so a flaky network
-// doesn't block the whole pack; the caller validates len(layers) > 0.
+// gatherLayers fetches containerd, kubeadm, k8s images, registry image and
+// the cilium helm chart for a single arch. Errors fetching a single source
+// are downgraded to warnings so a flaky network doesn't block the whole
+// pack; the caller validates len(layers) > 0. Defaults are pinned to the
+// versions ko's other components expect (k8s v1.32.0, cilium v1.16.1).
 func gatherLayers(cmd *cobra.Command, dl *image.UpstreamDownloader, cacheDir, arch string) ([]image.LayerSource, error) {
+	const (
+		k8sVersion    = "v1.32.0"
+		ciliumVersion = "1.16.1"
+	)
 	layers := []image.LayerSource{}
+
 	ctd, err := dl.Containerd(cmd.Context(), "v2.0.5", arch)
 	if err != nil {
 		logger.Warn("containerd download failed (skipping)", "arch", arch, "err", err)
@@ -130,15 +137,50 @@ func gatherLayers(cmd *cobra.Command, dl *image.UpstreamDownloader, cacheDir, ar
 			SrcPath: ctd, MediaType: image.MediaTypeKoContainerdTar,
 		})
 	}
-	chartDir := filepath.Join(cacheDir, "helm")
-	if charts, err := image.HelmPullDefault(cmd.Context(), "", "1.16.1", chartDir); err != nil {
-		logger.Warn("helm pull failed (skipping)", "arch", arch, "err", err)
+
+	kub, err := dl.Kubeadm(cmd.Context(), k8sVersion, arch)
+	if err != nil {
+		logger.Warn("kubeadm download failed (skipping)", "arch", arch, "err", err)
 	} else {
-		for _, p := range charts {
-			layers = append(layers, image.LayerSource{
-				SrcPath: p, MediaType: image.MediaTypeKoHelmChart,
-			})
-		}
+		layers = append(layers, image.LayerSource{
+			SrcPath: kub, MediaType: image.MediaTypeKoKubeadmBinary,
+		})
+	}
+
+	k8sTar, err := dl.K8sImagesTar(cmd.Context(), k8sVersion, arch)
+	if err != nil {
+		logger.Warn("k8s images pack failed (skipping)", "arch", arch, "err", err)
+	} else {
+		layers = append(layers, image.LayerSource{
+			SrcPath: k8sTar, MediaType: image.MediaTypeKoK8sImagesTar,
+		})
+	}
+
+	reg, err := dl.RegistryImage(cmd.Context(), arch)
+	if err != nil {
+		logger.Warn("registry image pack failed (skipping)", "arch", arch, "err", err)
+	} else {
+		layers = append(layers, image.LayerSource{
+			SrcPath: reg, MediaType: image.MediaTypeKoRegistryImage,
+		})
+	}
+
+	chart, err := dl.CiliumChartTGZ(cmd.Context(), ciliumVersion)
+	if err != nil {
+		logger.Warn("cilium chart download failed (skipping)", "arch", arch, "err", err)
+	} else {
+		layers = append(layers, image.LayerSource{
+			SrcPath: chart, MediaType: image.MediaTypeKoHelmChart,
+		})
+	}
+
+	ciliumImgs, err := dl.CiliumImagesTar(cmd.Context(), ciliumVersion)
+	if err != nil {
+		logger.Warn("cilium images pack failed (skipping)", "arch", arch, "err", err)
+	} else {
+		layers = append(layers, image.LayerSource{
+			SrcPath: ciliumImgs, MediaType: image.MediaTypeKoCiliumImagesTar,
+		})
 	}
 	return layers, nil
 }

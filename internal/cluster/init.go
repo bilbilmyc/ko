@@ -29,6 +29,13 @@ type Init struct {
 	KubeVip       *KubeVipInstaller
 	Offline       bool
 	BundlePath    string // local OCI image tarball when Offline=true
+
+	// imageRepositoryOverride, when set, replaces the image-repository
+	// kubeadm uses. Set by the offline runner to point kubeadm at the
+	// in-cluster mirror (e.g. "ko.local:5000") so it never hits the
+	// public registry.k8s.io. Empty falls back to cfg.Image.Registry +
+	// cfg.Image.Repository (the user-configured default).
+	imageRepositoryOverride string
 }
 
 // NewInitFromConfig wires concrete installers from a parsed + defaulted config.
@@ -97,18 +104,52 @@ func (i *Init) needsFlannel() bool {
 // Run executes the full init flow. masterHost must be the first master in
 // i.Cfg.Nodes.Masters (or the only master in non-HA setups).
 func (i *Init) Run(ctx context.Context, masterHost string) error {
+	// Offline mode: OfflineRunner has already installed containerd /
+	// kubeadm on master-1, started the in-cluster registry, pushed every
+	// bundled image, and written /etc/hosts on every node. It also sets
+	// imageRepositoryOverride so kubeadm and cilium pull from the local
+	// mirror instead of the public internet. After that, the rest of
+	// the init flow is identical to online mode — just skip the
+	// network-bound runtime install + node reachability ping.
 	hosts := i.allHosts()
-	if err := i.bootstrapHosts(ctx, hosts); err != nil {
-		return err
-	}
-	for _, h := range hosts {
-		if err := i.installRuntime(ctx, h); err != nil {
-			return fmt.Errorf("install runtime on %s: %w", h, err)
+	if i.Offline {
+		offline := &OfflineRunner{
+			Cfg:     i.Cfg,
+			Exec:    i.Exec,
+			Bundle:  i.BundlePath,
+			Master1: masterHost,
+		}
+		if err := offline.Run(ctx); err != nil {
+			return fmt.Errorf("offline prepare: %w", err)
+		}
+		i.imageRepositoryOverride = offline.LocalRegistry()
+	} else {
+		if err := i.bootstrapHosts(ctx, hosts); err != nil {
+			return err
+		}
+		for _, h := range hosts {
+			if err := i.installRuntime(ctx, h); err != nil {
+				return fmt.Errorf("install runtime on %s: %w", h, err)
+			}
 		}
 	}
-	for _, h := range hosts {
-		if err := i.bootstrapKubeadm(ctx, h); err != nil {
-			return fmt.Errorf("bootstrap kubeadm on %s: %w", h, err)
+	// In offline mode, OfflineRunner has already installed kubeadm to
+	// /usr/local/bin on master-1. bootstrapKubeadm is a no-op (idempotent
+	// apt/dnf install gated on a version match) but we still want to
+	// systemd-enable kubelet, so we let it run.
+	if !i.Offline {
+		for _, h := range hosts {
+			if err := i.bootstrapKubeadm(ctx, h); err != nil {
+				return fmt.Errorf("bootstrap kubeadm on %s: %w", h, err)
+			}
+		}
+	} else {
+		// Just enable kubelet on each host; the kubeadm binary itself
+		// is already in place from the bundle.
+		for _, h := range hosts {
+			if r := i.Exec.Run(ctx, h, "systemctl enable --now kubelet"); r.Failed() {
+				return fmt.Errorf("enable kubelet on %s: %w (stderr=%s)", h, r.Err, string(r.Stderr))
+			}
 		}
 	}
 	// S14: when the user opted into an external etcd cluster, we install
@@ -194,11 +235,15 @@ func (i *Init) bootstrapKubeadm(ctx context.Context, host string) error {
 }
 
 func (i *Init) runKubeadmInit(ctx context.Context, host string) error {
+	imageRepo := i.imageRepositoryOverride
+	if imageRepo == "" {
+		imageRepo = i.Cfg.Image.Registry + "/" + i.Cfg.Image.Repository
+	}
 	opts := KubeadmOptions{
 		KubernetesVersion:   i.Cfg.Cluster.Version,
 		PodCIDR:             i.Cfg.Cluster.CIDR,
 		ServiceCIDR:         i.Cfg.Cluster.SVCCIDR,
-		ImageRepository:     i.Cfg.Image.Registry + "/" + i.Cfg.Image.Repository,
+		ImageRepository:     imageRepo,
 		CertificateValidity: i.Cfg.Certificates.Validity,
 	}
 	if i.Cfg.HA.VIP != "" {
@@ -261,6 +306,7 @@ func (i *Init) joinMasters(ctx context.Context, masters []string) error {
 			DiscoveryTokenCAHash: hash,
 			APIServerEndpoint:   endpoint + ":6443",
 			CertKey:             certKey,
+			ImageRepository:     i.imageRepositoryOverride,
 		}
 		if _, err := i.Kubeadm.JoinControlPlane(ctx, m, opts); err != nil {
 			return fmt.Errorf("master %s join: %w", m, err)
@@ -287,6 +333,7 @@ func (i *Init) joinWorkers(ctx context.Context, workers []string) error {
 		opts := KubeadmOptions{
 			Token:               token,
 			DiscoveryTokenCAHash: hash,
+			ImageRepository:     i.imageRepositoryOverride,
 		}
 		if endpoint != "" {
 			opts.APIServerEndpoint = endpoint + ":6443"
