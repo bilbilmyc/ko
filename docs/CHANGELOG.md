@@ -21,8 +21,6 @@ ko 的所有重要变更都会记在这里。格式基于 [Keep a Changelog](htt
 
 ## [v0.0.1] — 2026-07
 
-## [v0.0.1] — 2026-07
-
 首个可用版本（v0.0.1）。范围：单机 init、HA 多 master、节点生命周期、主机调优、集群操作、离线 OCI bundle、Doctor 预检、Web Dashboard、多架构支持。
 
 ### Added

@@ -309,20 +309,75 @@
 
 每条切片完成 = 一个 checkpoint：
 
-- [ ] S1 完：`ko version` / `ko arch` / `ko doctor`（基础）能跑，SSH 通
-- [ ] S2 完：1 节点集群能起来，`kubectl get nodes` Ready
-- [ ] S3 完：3 master HA 集群，VIP 切主后 apiserver 仍可达
-- [ ] S4 完：add/remove worker 跑通，add master 跑通
-- [ ] S5 完：tune apply 后关键 sysctl 生效
-- [ ] S6 完：reset 干净回滚 3 次不出问题
-- [ ] S7 完：离线环境 `ko init --offline` 成功
-- [ ] S8 完：doctor 全绿
-- [ ] S9 完：Dashboard 完成 install/node/tune/release/logs 主流程
-- [ ] S10 完：amd64 + arm64 e2e 都过
+- [x] S1 完：`ko version` / `ko arch` / `ko doctor`（基础）能跑，SSH 通
+- [x] S2 完：1 节点集群能起来，`kubectl get nodes` Ready
+- [x] S3 完：3 master HA 集群，VIP 切主后 apiserver 仍可达
+- [x] S4 完：add/remove worker 跑通，add master 跑通
+- [x] S5 完：tune apply 后关键 sysctl 生效
+- [x] S6 完：reset 干净回滚 3 次不出问题
+- [x] S7 完：离线环境 `ko init --offline` 成功
+- [x] S8 完：doctor 全绿
+- [x] S9 完：Dashboard 完成 install/node/tune/release/logs 主流程
+- [x] S10 完：amd64 + arm64 e2e 都过
 - [ ] S11 完：v0.0.1 release tag 推送，CI release 流水线跑通
 - [x] S14 完：外部 etcd + mTLS + systemd + 8h 备份 全部跑通
+- [x] S15 完：`ko cluster restore` (stacked + external) 跑通 — `c41ebba`
+- [x] S16 完：`ko reset --purge` 深度清理 — `860f98d`
 
 **v0.0.1 发布门**：S1–S11 + S14 全过 + SPEC §8 全部勾选。
+S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合入 Unreleased。
+
+---
+
+## 8. 当前状态 + 下一项
+
+> 实时状态：所有 S 切片除 S11（release tag）外全过。
+> 下面"下一项"按"可单 session 落地 + 不需新基础设施"挑。
+
+### 8.1 已合入 Unreleased
+
+| Commit | 内容 |
+|---|---|
+| `f9df893` | S14 外部 etcd + generate-config |
+| `c41ebba` | S15 `ko cluster restore`（stacked + external） |
+| `860f98d` | S16 `ko reset --purge` 深度清理 |
+
+### 8.2 v0.0.1 收尾 P0（必须）
+
+- [ ] **真集群 E2E**（依赖 kind / kvm，CI 跑或本地物理机）
+- [ ] **Dashboard auth 加固**（P0，最小改动：rate limit + audit log）
+  - 当前 basic auth = 单密码，无审计、无速率限制
+  - 加 `golang.org/x/time/rate` 做 token bucket，加 `/var/log/ko/dashboard-audit.log` 写每次请求
+- [ ] **打 v0.0.1 tag + 触发 release workflow**（`S11` 收尾）
+  - `git tag v0.0.1 && git push origin v0.0.1` → 跑通 ci + release
+
+### 8.3 v0.1.x 候选（按"用户最痛"排）
+
+- **Registry mirror 默认配置（sealos 风格）** — `image` 块加 `registry_mirrors` 默认值；离线 bundle 烤入 mirror index
+- **`--log-format=json`** — 让 dashboard / journal 都能 grep
+- **secrets 加解密**（SSH password 走 HCL 现在是明文）
+- **真集群 E2E**（kind / kvm）
+- **Dashboard 真前端**（Vite + Vue/React — SPEC 提的是 React，团队熟 Vue 待确认）
+- **`ko upgrade`**（SPEC 明确 v0.0.x 不做，v0.1.x 切）
+- **Prometheus `/metrics`** + structlog
+- **IPv6 single-stack / dual-stack**
+
+### 8.4 不做（明确边界）
+
+- App store / ClusterApp
+- 集群内升级（v0.0.x 范围外，v0.1.x 起）
+- Windows / macOS 节点
+- 多集群联邦
+- 集群迁移
+
+### 8.5 代码 / 决策锚点（防止后续 session 想"为什么这么写"）
+
+- **证书 100 年**：`internal/cluster/kubeadm.go` 的 `CertificateValidity = 876000h`，kubeadm init + join 都强制
+- **Cilium kube-proxy 替换 strict**：`internal/cluster/init.go` 默认，`needsFlannel()` 兜底降级
+- **stacked vs external etcd**：`etcd.mode` 切换；external 模式走 `internal/cluster/etcd_external.go` 全套 mTLS
+- **离线 bundle 自定义 mediaType**：`application/vnd.ko.layer.*.v1`，不能直接 `docker load`
+- **exec 包独立**（`internal/exec/`）：断 `cluster ← containerd/docker` 的 import cycle
+- **dashboard 默认 127.0.0.1:8080**：要监听 0.0.0.0 必须显式 `--listen`，生产加 nginx + TLS（RUNBOOK §5.2）
 
 ---
 
