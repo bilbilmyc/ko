@@ -7,6 +7,7 @@ ko 的所有重要变更都会记在这里。格式基于 [Keep a Changelog](htt
 
 ### Added
 
+- **Dashboard 速率限制 + 审计日志** — `golang.org/x/time/rate` token bucket（默认 1 req/s, burst 20）挡在 basicAuth 前；`/var/log/ko/dashboard-audit.log`（mode 0600，append-only）记录所有请求（200 / 401 / 429 / 500），字段：RFC3339Nano remote user method path status bytes dur；新增 `--rate-limit` / `--rate-burst` / `--audit-log` flag，审计失败降级到 `io.Discard` 不阻塞请求
 - **`ko reset --purge` 强化清理** — 默认 reset 在原 `kubeadm reset` 基础上额外清理:`/etc/cni/net.d`、`/opt/cni/bin`、`/var/lib/cni`、CNI / Cilium / kube-ipvs0 / veth* 接口、所有 iptables 表（filter/nat/mangle/raw）、overlay + kubelet pod volume 挂载、`/etc/systemd/system/{etcd,ko-etcd-backup,containerd}.service`、`/var/lib/etcd`(per-member) / `/etc/etcd` / `/var/backups/etcd`、`/etc/containerd/config.toml`、`/etc/docker/daemon.json`、kubelet drop-in;`--purge` 进一步清空 `/var/lib/{containerd,docker,ko}`、`/root/.ko`、ctr k8s.io 容器;external etcd 模式自动先调 `UninstallExternalEtcd`
 - **`Teardown.ResetAllWithConfig(cfg)`** — 新的入口,按 `cfg.Etcd.Mode` 自动决定是否先卸外部 etcd
 - **`Teardown.Purge` 字段** — 控制 `--purge` 行为

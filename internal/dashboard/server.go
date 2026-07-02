@@ -8,9 +8,14 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
-	"strings"
+	"os"
+	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 
 	"github.com/ko-build/ko/internal/logger"
 )
@@ -27,22 +32,62 @@ type Config struct {
 	Certs       CertsAPI
 	ClusterInfo ClusterInfoAPI
 	Etcd        EtcdAPI
+
+	// RateLimit gates incoming requests with a token bucket. 0 disables
+	// rate limiting (use for local-only deployments). Default: 1.0 req/s.
+	RateLimit rate.Limit
+	// RateBurst is the max number of requests allowed in a single burst.
+	// 0 picks a default of 20.
+	RateBurst int
+
+	// AuditLog is the path to the append-only audit log file. Empty
+	// disables audit logging. The file is opened with mode 0600 in
+	// append-create mode on New(); failures are logged but do not block
+	// the server (audit is best-effort).
+	AuditLog string
 }
 
 // Server wraps the http.Server + handler.
 type Server struct {
 	cfg Config
 	httpSrv *http.Server
+
+	// auditOut is the sink audit lines are written to. It's either an
+	// *os.File (when AuditLog is configured and openable) or io.Discard.
+	auditOut io.Writer
+	auditMu  sync.Mutex // serialize WriteString calls; the underlying file is shared
 }
 
 // New returns a server bound to cfg.Listen. Caller must Run() then Shutdown().
 func New(cfg Config) *Server {
+	s := &Server{cfg: cfg, auditOut: io.Discard}
+
+	if cfg.AuditLog != "" {
+		f, err := os.OpenFile(cfg.AuditLog, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			logger.Error("dashboard audit log open failed; auditing disabled",
+				"path", cfg.AuditLog, "err", err)
+		} else {
+			s.auditOut = f
+		}
+	}
+
 	mux := http.NewServeMux()
-	s := &Server{cfg: cfg}
 	s.routes(mux)
+
+	// Middleware chain (outermost first):
+	//   recoverer → audit → rateLimit → basicAuth → mux
+	//
+	// Order rationale:
+	//   - recoverer outermost so panic-recovered 500s are still audited.
+	//   - audit next so it observes the final status written by rateLimit
+	//     (429) and basicAuth (401) rejections without the overhead of
+	//     re-reading the wrapped ResponseWriter.
+	//   - rateLimit before basicAuth so a brute-force scanner can't burn
+	//     CPU on constant-time compares once it's already past the limiter.
 	s.httpSrv = &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           s.recoverer(s.basicAuth(mux)),
+		Handler:           s.recoverer(s.audit(s.rateLimit(s.basicAuth(mux)))),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	return s
@@ -50,16 +95,25 @@ func New(cfg Config) *Server {
 
 // Run blocks until the server stops.
 func (s *Server) Run() error {
-	logger.Info("dashboard listening", "addr", s.cfg.Listen)
+	logger.Info("dashboard listening",
+		"addr", s.cfg.Listen,
+		"rate_limit", fmt.Sprint(s.cfg.RateLimit),
+		"rate_burst", s.cfg.RateBurst,
+		"audit_log", s.cfg.AuditLog,
+	)
 	if err := s.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	return nil
 }
 
-// Shutdown gracefully stops the server.
+// Shutdown gracefully stops the server and closes the audit log file (if any).
 func (s *Server) Shutdown(ctx context.Context) error {
-	return s.httpSrv.Shutdown(ctx)
+	err := s.httpSrv.Shutdown(ctx)
+	if f, ok := s.auditOut.(*os.File); ok {
+		_ = f.Close()
+	}
+	return err
 }
 
 func (s *Server) routes(mux *http.ServeMux) {
@@ -96,6 +150,91 @@ func (s *Server) basicAuth(next http.Handler) http.Handler {
 			return
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+// rateLimit enforces a global token bucket. Disabled when RateLimit == 0.
+// We use a single bucket (not per-IP) to keep memory bounded; the default
+// of 1 req/s with burst 20 is loose enough for an ops dashboard shared by
+// a small team. Use rate=0 to disable.
+func (s *Server) rateLimit(next http.Handler) http.Handler {
+	if s.cfg.RateLimit <= 0 {
+		return next
+	}
+	burst := s.cfg.RateBurst
+	if burst <= 0 {
+		burst = 20
+	}
+	lim := rate.NewLimiter(s.cfg.RateLimit, burst)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !lim.Allow() {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// auditingResponseWriter captures the response status and byte count so
+// the audit middleware can record what actually happened.
+type auditingResponseWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (a *auditingResponseWriter) WriteHeader(code int) {
+	if a.status == 0 {
+		a.status = code
+	}
+	a.ResponseWriter.WriteHeader(code)
+}
+
+func (a *auditingResponseWriter) Write(p []byte) (int, error) {
+	if a.status == 0 {
+		a.status = http.StatusOK
+	}
+	n, err := a.ResponseWriter.Write(p)
+	a.bytes += n
+	return n, err
+}
+
+// audit logs one line per request. The "user" is the BasicAuth user (or
+// "-" for unauthenticated requests). Failures to open the audit log are
+// non-fatal (logged at server start); failures to write a single line are
+// logged but do not block the response.
+func (s *Server) audit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		user, _, _ := r.BasicAuth()
+		if user == "" {
+			user = "-"
+		}
+		aw := &auditingResponseWriter{ResponseWriter: w}
+		next.ServeHTTP(aw, r)
+
+		status := aw.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+
+		line := fmt.Sprintf("%s remote=%s user=%s method=%s path=%s status=%d bytes=%d dur=%s\n",
+			time.Now().UTC().Format(time.RFC3339Nano),
+			r.RemoteAddr,
+			user,
+			r.Method,
+			r.URL.Path,
+			status,
+			aw.bytes,
+			time.Since(start).Round(time.Microsecond),
+		)
+		s.auditMu.Lock()
+		_, err := s.auditOut.Write([]byte(line))
+		s.auditMu.Unlock()
+		if err != nil {
+			logger.Error("dashboard audit write failed", "err", err, slog.Any("remote", r.RemoteAddr))
+		}
 	})
 }
 
@@ -147,14 +286,3 @@ ul { line-height: 1.7; }
   <li><code>GET /api/etcd/backups</code></li>
 </ul>
 </body></html>`
-
-// trimPath is a placeholder for future path-based logging; currently unused
-// but kept to make the public API stable across refactors.
-var _ = trimPath
-
-func trimPath(p string) string {
-	if p, _, ok := strings.Cut(p, "?"); ok {
-		return p
-	}
-	return p
-}

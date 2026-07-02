@@ -3,12 +3,12 @@ package cli
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/time/rate"
 
 	"github.com/ko-build/ko/internal/cluster"
 	"github.com/ko-build/ko/internal/dashboard"
@@ -22,6 +22,9 @@ func newDashboardCmd() *cobra.Command {
 		staticDir string
 		user      string
 		password  string
+		rateLimit float64
+		rateBurst int
+		auditLog  string
 	)
 	cmd := &cobra.Command{
 		Use:   "dashboard",
@@ -57,6 +60,10 @@ func newDashboardCmd() *cobra.Command {
 
 			api := newAPIAdapter(cfg)
 
+			rl := rate.Limit(rateLimit)
+			if rateLimit <= 0 {
+				rl = 0 // disabled
+			}
 			srv := dashboard.New(dashboard.Config{
 				Listen:      listen,
 				User:        user,
@@ -66,8 +73,17 @@ func newDashboardCmd() *cobra.Command {
 				Node:        api,
 				Certs:       api,
 				Etcd:        api,
+				RateLimit:   rl,
+				RateBurst:   rateBurst,
+				AuditLog:    auditLog,
 			})
 			cmd.Printf("ko dashboard: listening on http://%s (user=%s)\n", listen, user)
+			if rl > 0 {
+				cmd.Printf("  rate limit: %.2f req/s, burst %d\n", float64(rl), rateBurst)
+			}
+			if auditLog != "" {
+				cmd.Printf("  audit log:  %s\n", auditLog)
+			}
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -85,6 +101,9 @@ func newDashboardCmd() *cobra.Command {
 	cmd.Flags().StringVar(&staticDir, "static-dir", "", "directory with built frontend (default: embedded minimal page)")
 	cmd.Flags().StringVar(&user, "user", "", "basic auth user (default from cluster.hcl dashboard.basic_auth.user)")
 	cmd.Flags().StringVar(&password, "password", "", "basic auth password (default $KO_DASHBOARD_PASSWORD)")
+	cmd.Flags().Float64Var(&rateLimit, "rate-limit", 1.0, "requests per second per server (token bucket); 0 disables")
+	cmd.Flags().IntVar(&rateBurst, "rate-burst", 20, "max requests in a burst before rate-limit kicks in")
+	cmd.Flags().StringVar(&auditLog, "audit-log", "/var/log/ko/dashboard-audit.log", "append-only audit log file path (0600); empty string disables")
 	return cmd
 }
 
@@ -264,6 +283,3 @@ func (a *apiAdapter) ListBackups() ([]dashboard.EtcdBackup, error) {
 	}
 	return out, nil
 }
-
-// io.Discard keep the import alive if not used directly.
-var _ = io.Discard

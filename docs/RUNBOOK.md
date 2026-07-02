@@ -272,9 +272,45 @@ server {
 }
 ```
 
-### 5.3 不要暴露到公网
+### 5.3 速率限制（token bucket）
 
-Dashboard 没有审计日志，没有速率限制，basic auth 是唯一防线。**只**监听 127.0.0.1，或放在内网 nginx 后。
+Dashboard 在 auth 之前挡一层 token bucket，默认 **1 req/s，burst 20**（全局共享，非 per-IP）。防扫描器 / 错误客户端。429 响应带 `Retry-After: 1`。
+
+```bash
+# 调紧（生产、放在 nginx 后）
+ko dashboard --config cluster.hcl --rate-limit 5 --rate-burst 50
+
+# 关闭（仅本机 dev）
+ko dashboard --config cluster.hcl --rate-limit 0
+```
+
+### 5.4 审计日志
+
+每次请求写一行到审计文件（默认 `/var/log/ko/dashboard-audit.log`，mode 0600，append-only）。记录 **所有**响应：200 / 401（未认证，user=`-`）/ 429（限流）/ 500（panic）。失败时降级到 `io.Discard` + log，不阻塞请求。
+
+格式（RFC3339Nano 起头）：
+
+```
+2026-07-02T10:23:45.123456Z remote=10.0.0.5:54321 user=admin method=POST path=/api/nodes/add status=200 bytes=42 dur=12.3ms
+2026-07-02T10:23:46.001000Z remote=10.0.0.5:54322 user=-      method=GET  path=/api/healthz     status=401 bytes=12 dur=200µs
+```
+
+```bash
+# 改路径
+ko dashboard --config cluster.hcl --audit-log /var/log/ko/audit.log
+
+# 关闭（不推荐生产开）
+ko dashboard --config cluster.hcl --audit-log ""
+```
+
+### 5.5 不要暴露到公网
+
+加完 rate limit + audit 后，basic auth 仍**不是**强认证。**只**监听 127.0.0.1，或放在内网 nginx + TLS 后。生产推荐：
+
+1. `ko dashboard --listen 127.0.0.1:8080`（默认）
+2. nginx 监听 443，转发到 8080，TLS 终止
+3. audit log 用 `logrotate` 滚动（`/etc/logrotate.d/ko-dashboard`）
+4. rate limit 留默认或调高（nginx 自身能挡 L7 DoS）
 
 ## 6. 备份与恢复
 

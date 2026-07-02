@@ -341,13 +341,15 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 | `f9df893` | S14 外部 etcd + generate-config |
 | `c41ebba` | S15 `ko cluster restore`（stacked + external） |
 | `860f98d` | S16 `ko reset --purge` 深度清理 |
+| 待提交 | Dashboard 加固（rate limit + audit log，`golang.org/x/time/rate`） |
 
 ### 8.2 v0.0.1 收尾 P0（必须）
 
 - [ ] **真集群 E2E**（依赖 kind / kvm，CI 跑或本地物理机）
-- [ ] **Dashboard auth 加固**（P0，最小改动：rate limit + audit log）
-  - 当前 basic auth = 单密码，无审计、无速率限制
-  - 加 `golang.org/x/time/rate` 做 token bucket，加 `/var/log/ko/dashboard-audit.log` 写每次请求
+- [x] **Dashboard auth 加固**（rate limit + audit log，`golang.org/x/time/rate`）
+  - 中间件链 `recoverer → audit → rateLimit → basicAuth → mux`
+  - 审计记录所有响应（200 / 401 user=`-` / 429 / 500）；rate limit 默认 1 req/s burst 20 全局共享；`--rate-limit=0` 关闭
+  - 失败降级：audit 文件打不开 → `io.Discard` + log；写失败仅 log 不阻塞
 - [ ] **打 v0.0.1 tag + 触发 release workflow**（`S11` 收尾）
   - `git tag v0.0.1 && git push origin v0.0.1` → 跑通 ci + release
 
