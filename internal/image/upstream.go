@@ -260,6 +260,104 @@ func (p *cliPuller) Save(ctx context.Context, dest string, images []string) erro
 	if err != nil {
 		return fmt.Errorf("%s save: %w (out=%s)", p.bin, err, strings.TrimSpace(string(out)))
 	}
+	// docker / nerdctl emit docker-archive tarballs that store a separate
+	// copy of every shared layer blob under blobs/sha256/<digest>. On
+	// storage drivers without cross-image dedup (docker's vfs in GitHub
+	// Actions runners, for example), this triples the tar size for the
+	// k8s / cilium image sets. Manifest.json still references blobs by
+	// sha256 path, so ctr images import works just fine if we rewrite the
+	// tar with each blob present only once.
+	deduped := dest + ".dedup"
+	if err := dedupDockerArchive(dest, deduped); err != nil {
+		// Dedup is best-effort — fall back to the un-deduped tar.
+		logger.Warn("docker-archive dedup failed; using un-deduped tar", "err", err)
+		return nil
+	}
+	if err := os.Rename(deduped, dest); err != nil {
+		logger.Warn("rename deduped tar failed; using un-deduped tar", "err", err)
+	}
+	return nil
+}
+
+// dedupDockerArchive reads a docker-archive tar at src and writes a copy at
+// dst with each blobs/sha256/<digest> file stored only once. Non-blob entries
+// (manifest.json, configs, repositories) are passed through verbatim.
+//
+// The output remains a valid docker-archive — ctr images import looks up
+// blobs by the path written in manifest.json, which is content-addressable
+// by sha256. We just collapse duplicate copies in the tar stream.
+func dedupDockerArchive(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tr := tar.NewReader(in)
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	tw := tar.NewWriter(out)
+	defer tw.Close()
+
+	// First pass: collect manifest.json so we know which blobs each image
+	// expects. We don't actually need it to dedup — manifest.json still
+	// references the same path after dedup — but we log if it looks
+	// malformed so dedup failures are diagnosable.
+	var manifestData []byte
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if h.Name == "manifest.json" {
+			manifestData, err = io.ReadAll(tr)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if len(manifestData) == 0 {
+		return fmt.Errorf("no manifest.json in docker-archive; refusing to dedup")
+	}
+
+	// Second pass: rewrite the tar with each blob present only once.
+	seen := make(map[string]bool)
+	if _, err := in.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	tr = tar.NewReader(in)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		isBlob := strings.HasPrefix(h.Name, "blobs/sha256/")
+		if isBlob && seen[h.Name] {
+			// Drain the entry without writing it.
+			if _, err := io.Copy(io.Discard, tr); err != nil {
+				return err
+			}
+			continue
+		}
+		if isBlob {
+			seen[h.Name] = true
+		}
+		if err := tw.WriteHeader(h); err != nil {
+			return err
+		}
+		if _, err := io.Copy(tw, tr); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
