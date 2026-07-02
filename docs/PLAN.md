@@ -341,7 +341,7 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 | `f9df893` | S14 外部 etcd + generate-config |
 | `c41ebba` | S15 `ko cluster restore`（stacked + external） |
 | `860f98d` | S16 `ko reset --purge` 深度清理 |
-| 待提交 | Dashboard 加固（rate limit + audit log，`golang.org/x/time/rate`） |
+| `ed50f66` | Dashboard 加固（rate limit + audit log，`golang.org/x/time/rate`） |
 
 ### 8.2 v0.0.1 收尾 P0（必须）
 
