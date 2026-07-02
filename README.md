@@ -60,32 +60,16 @@ make build-all       # 同时构建 amd64 + arm64
 ### 在线安装（默认）
 
 ```bash
-# 1. 写一份 cluster.hcl（详见 docs/SPEC.md）
-cat > cluster.hcl <<'EOF'
-cluster {
-  name    = "demo"
-  version = "1.30.0"
-  cidr    = "10.244.0.0/16"
-  svc_cidr = "10.96.0.0/12"
-}
+# 1. 生成一份 cluster.hcl（sealos 风格：选 profile，写带文档注释的配置）
+#    可选 profile: single | ha | external-etcd
+ko init --generate-config=ha -o cluster.hcl
 
-nodes {
-  masters = ["10.0.0.11", "10.0.0.12", "10.0.0.13"]
-  workers = ["10.0.0.21", "10.0.0.22"]
-  ssh {
-    user = "root"
-    key_file = "/root/.ssh/id_rsa"
-  }
-}
+# 2. 按需编辑 cluster.hcl（已自动 include 每个字段的注释）
 
-runtime { default = "containerd" }
-cni     { plugin  = "cilium" }
-EOF
-
-# 2. 预检
+# 3. 预检
 ko doctor --config cluster.hcl
 
-# 3. 初始化（先 init 第一个 master，后续会自动 join 其余 master 和 worker）
+# 4. 初始化（先 init 第一个 master，后续会自动 join 其余 master 和 worker）
 ko init --config cluster.hcl
 ```
 
@@ -145,10 +129,12 @@ ko version                         工具版本（git describe 注入）
 ko arch                            当前二进制 arch
 ko doctor [--config]               预检（kernel / swap / runtime / 端口）
 ko init   --config [master]        初始化集群（在线 / 离线）
+ko init   --generate-config=PROF   生成 starter 配置（sealos 风格，单机/HA/外部 etcd）
 ko node   list|add|remove|label    节点生命周期
 ko tune   apply|show|reset         主机调优（profile 化）
 ko reset                          释放集群
 ko cluster info|certs|backup       集群操作（备份 etcd / 查证书）
+ko etcd   install|status|backup|uninstall  外部 etcd 生命周期（S14）
 ko pack   build|inspect            离线 OCI bundle（支持 --arch all）
 ko dashboard                      Web Dashboard（basic auth + REST）
 ko completion <bash|zsh|fish>      shell 补全

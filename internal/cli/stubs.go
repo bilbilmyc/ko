@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -16,9 +17,13 @@ import (
 
 func newInitCmd() *cobra.Command {
 	var (
-		runtimeFlag string
-		offline     bool
-		bundle      string
+		runtimeFlag    string
+		offline        bool
+		bundle         string
+		generateConfig string
+		profile        string
+		outputPath     string
+		forceOverwrite bool
 	)
 	cmd := &cobra.Command{
 		Use:   "init",
@@ -26,8 +31,17 @@ func newInitCmd() *cobra.Command {
 		Long: `init runs the full single-master bootstrap on the first host listed
 in ` + "`nodes.masters`" + ` (or whichever host you pass via --master). It installs the
 configured container runtime, bootstraps kubeadm, runs ` + "`kubeadm init`" + `, then
-installs kube-vip and Cilium with kube-proxy replacement.`,
+installs kube-vip and Cilium with kube-proxy replacement.
+
+Use ` + "`--generate-config=PROFILE`" + ` to write a starter config file (sealos-style) instead
+of running an actual init. Profiles: single | ha | external-etcd.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Branch 1: --generate-config (sealos-style). No SSH, no init —
+			// we just write the chosen profile template and exit.
+			if generateConfig != "" {
+				return runGenerateConfig(cmd, generateConfig, profile, outputPath, forceOverwrite)
+			}
+
 			cfgPath := flags.ConfigPath
 			if cfgPath == "" {
 				return fmt.Errorf("--config is required")
@@ -88,7 +102,55 @@ installs kube-vip and Cilium with kube-proxy replacement.`,
 	cmd.Flags().StringVar(&runtimeFlag, "runtime", "", "override runtime: containerd | docker")
 	cmd.Flags().BoolVar(&offline, "offline", false, "init from local bundle (use --bundle or --offline global)")
 	cmd.Flags().StringVar(&bundle, "bundle", "", "path to ko offline OCI image (when --offline)")
+	// --generate-config is mutually exclusive with --config: it WRITES the
+	// config file, doesn't read one. We still keep them separate flags so a
+	// user can say `ko init --generate-config=ha --output ./prod.hcl` without
+	// setting --config.
+	cmd.Flags().StringVar(&generateConfig, "generate-config", "", "write a starter config file and exit (sealos-style). profiles: single|ha|external-etcd")
+	cmd.Flags().StringVar(&profile, "profile", "", "optional profile selector when --generate-config is set (default: same as --generate-config)")
+	cmd.Flags().StringVarP(&outputPath, "output", "o", "", "output path for --generate-config (default: ./cluster.hcl, or --config value)")
+	cmd.Flags().BoolVarP(&forceOverwrite, "force", "f", false, "overwrite existing file when used with --generate-config")
 	return cmd
+}
+
+// runGenerateConfig implements the sealos-style `ko init --generate-config`
+// branch. It picks a profile, renders the embedded template, and writes
+// the result via WriteAtomic.
+func runGenerateConfig(cmd *cobra.Command, generate, profileFlag, outputPath string, force bool) error {
+	// If --profile wasn't given, derive it from --generate-config.
+	prof := profileFlag
+	if prof == "" {
+		prof = generate
+	}
+	if !config.IsValidProfile(prof) {
+		return fmt.Errorf("invalid profile %q (want one of: %s)",
+			prof, strings.Join(config.ListProfiles(), ", "))
+	}
+
+	// Resolve output path: --output wins, else --config, else ./cluster.hcl.
+	out := outputPath
+	if out == "" {
+		out = flags.ConfigPath
+	}
+	if out == "" {
+		out = "./cluster.hcl"
+	}
+
+	vars := config.DefaultVars()
+	data, err := config.RenderTemplate(prof, vars)
+	if err != nil {
+		return fmt.Errorf("render %q: %w", prof, err)
+	}
+
+	n, err := config.WriteAtomic(out, data, force)
+	if err != nil {
+		return err
+	}
+	cmd.Printf("✓ wrote %s profile to %s (%d bytes)\n", prof, out, n)
+	cmd.Println("next:")
+	cmd.Println("  ko doctor --config", out)
+	cmd.Println("  ko init   --config", out)
+	return nil
 }
 
 func homeDir() string {

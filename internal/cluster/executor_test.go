@@ -82,7 +82,7 @@ func TestLocalExecutor_PropagatesExitError(t *testing.T) {
 	le := NewLocalExecutor()
 	defer le.Close()
 
-	res := le.Run(context.Background(), "", "false")
+	res := le.Run(context.Background(), "", `sh -c 'echo ko-stderr-test >&2; exit 1'`)
 	assert.True(t, res.Failed())
 	assert.NotEmpty(t, res.Stderr)
 }

@@ -5,6 +5,16 @@ ko 的所有重要变更都会记在这里。格式基于 [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Added
+
+- **S14 外部 etcd** — etcd 3.5.21 作为外部二进制 + systemd unit + mTLS 自签 PKI（ca / server / peer / client）+ 8 小时 systemd timer 备份（14 天滚动）+ dashboard `/api/etcd/{status,backups}` 端点
+- **`ko etcd install|status|backup|uninstall` 命令族**
+- **sealos 风格 `ko init --generate-config=PROFILE`** — profile: `single` / `ha` / `external-etcd`,带嵌入式 HCL 模板 + 注释
+- **race-mode CI 修复** — `internal/cluster/local_exec.go` 缓冲区在 `cmd.Run()` 之后读取,`TestLocalExecutor_PropagatesExitError` 改用 `sh -c 'echo ... >&2; exit 1'`
+- **Go 1.25.5 锁版本** — `go.mod` 1.26.4,CI/release workflow 用 1.25.5,`helm.sh/helm/v3` 锁 v3.21.0（v3.21.x 系列里最后一个不要求 Go 1.26 的版本）
+
+## [v0.0.1] — 2026-07
+
 ## [v0.0.1] — 2026-07
 
 首个可用版本（v0.0.1）。范围：单机 init、HA 多 master、节点生命周期、主机调优、集群操作、离线 OCI bundle、Doctor 预检、Web Dashboard、多架构支持。

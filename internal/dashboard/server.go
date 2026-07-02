@@ -26,6 +26,7 @@ type Config struct {
 	Tune        TuneAPI
 	Certs       CertsAPI
 	ClusterInfo ClusterInfoAPI
+	Etcd        EtcdAPI
 }
 
 // Server wraps the http.Server + handler.
@@ -68,6 +69,8 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/nodes/remove", s.handleNodeRemove)
 	mux.HandleFunc("/api/tune/apply", s.handleTuneApply)
 	mux.HandleFunc("/api/certs", s.handleCerts)
+	mux.HandleFunc("/api/etcd/status", s.handleEtcdStatus)
+	mux.HandleFunc("/api/etcd/backups", s.handleEtcdBackups)
 	mux.HandleFunc("/api/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -140,6 +143,8 @@ ul { line-height: 1.7; }
   <li><code>POST /api/nodes/remove</code> body: {"host":"w1","force":false}</li>
   <li><code>POST /api/tune/apply</code>  body: {"profile":"production"}</li>
   <li><code>GET /api/certs</code></li>
+  <li><code>GET /api/etcd/status</code></li>
+  <li><code>GET /api/etcd/backups</code></li>
 </ul>
 </body></html>`
 

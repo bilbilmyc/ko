@@ -12,6 +12,7 @@ import (
 
 	"github.com/ko-build/ko/internal/cluster"
 	"github.com/ko-build/ko/internal/dashboard"
+	"github.com/ko-build/ko/internal/etcd"
 	"github.com/ko-build/ko/internal/logger"
 	"github.com/ko-build/ko/pkg/config"
 )
@@ -64,6 +65,7 @@ func newDashboardCmd() *cobra.Command {
 				ClusterInfo: api,
 				Node:        api,
 				Certs:       api,
+				Etcd:        api,
 			})
 			cmd.Printf("ko dashboard: listening on http://%s (user=%s)\n", listen, user)
 
@@ -191,6 +193,74 @@ func (a *apiAdapter) ListCerts() ([]dashboard.CertInfo, error) {
 			NotAfter: c.NotAfter.Format("2006-01-02"),
 			Subject:  c.Subject,
 		})
+	}
+	return out, nil
+}
+
+// EtcdAPI implementation on apiAdapter — returns nil/empty when the
+// config is in stacked etcd mode (so the dashboard renders "stacked"
+// rather than failing).
+func (a *apiAdapter) Status() (*dashboard.EtcdStatus, error) {
+	if a.cfg.Etcd.Mode != "external" {
+		return nil, nil
+	}
+	ex, closer, err := a.sshExec()
+	if err != nil {
+		return nil, err
+	}
+	defer closer()
+	members := cluster.EtcdExternalMembers(a.cfg)
+	svc := etcd.NewService(ex, "", "v"+trimV(etcd.DefaultVersion), etcd.ClusterConfig{
+		Members:      members,
+		ClusterToken: "ko-etcd-" + a.cfg.Cluster.Name,
+		PKIDir:       a.cfg.Etcd.PKIDir,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	statuses, err := svc.Status(ctx, members)
+	if err != nil {
+		return nil, err
+	}
+	st := &dashboard.EtcdStatus{Mode: "external"}
+	for _, s := range statuses {
+		st.Members = append(st.Members, dashboard.EtcdMember{
+			Name:           s.Name,
+			Host:           s.Host,
+			Active:         s.Active,
+			EndpointHealth: s.EndpointHealth,
+		})
+	}
+	return st, nil
+}
+
+func (a *apiAdapter) ListBackups() ([]dashboard.EtcdBackup, error) {
+	if a.cfg.Etcd.Mode != "external" {
+		return nil, nil
+	}
+	ex, closer, err := a.sshExec()
+	if err != nil {
+		return nil, err
+	}
+	defer closer()
+	backup := etcd.NewBackupService(ex)
+	backup.PKIDir = a.cfg.Etcd.PKIDir
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var out []dashboard.EtcdBackup
+	for _, m := range a.cfg.Etcd.Members {
+		list, err := backup.ListBackups(ctx, m.Host)
+		if err != nil {
+			continue
+		}
+		for _, b := range list {
+			out = append(out, dashboard.EtcdBackup{
+				Host:     b.Host,
+				Name:     b.Name,
+				Filename: b.Filename,
+				Size:     b.Size,
+				ModTime:  b.ModTime,
+			})
+		}
 	}
 	return out, nil
 }

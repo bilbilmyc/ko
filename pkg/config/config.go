@@ -58,8 +58,15 @@ type DockerSubBlock struct {
 }
 
 type EtcdBlock struct {
-	Mode      string   `hcl:"mode,optional"`
-	Endpoints []string `hcl:"endpoints,optional"`
+	Mode      string         `hcl:"mode,optional"`
+	Endpoints []string       `hcl:"endpoints,optional"`
+	Members   []EtcdMemberBlock `hcl:"members,block"`
+	PKIDir    string         `hcl:"pki_dir,optional"`
+}
+
+type EtcdMemberBlock struct {
+	Name string `hcl:"name,label"`
+	Host string `hcl:"host,optional"`
 }
 
 type HABlock struct {
@@ -132,6 +139,7 @@ var topLevelBlockSchemas = []hcl.BlockHeaderSchema{
 	{Type: "containerd", LabelNames: nil},
 	{Type: "runtime", LabelNames: nil},
 	{Type: "etcd", LabelNames: nil},
+	{Type: "members", LabelNames: []string{"name"}},
 	{Type: "ha", LabelNames: nil},
 	{Type: "cni", LabelNames: nil},
 	{Type: "nodes", LabelNames: nil},
@@ -183,6 +191,13 @@ func decodeOneBlock(blk *hcl.Block, out *File) error {
 		diags = gohcl.DecodeBody(blk.Body, nil, &out.Runtime)
 	case "etcd":
 		diags = gohcl.DecodeBody(blk.Body, nil, &out.Etcd)
+	case "members":
+		var m EtcdMemberBlock
+		diags = gohcl.DecodeBody(blk.Body, nil, &m)
+		if !diags.HasErrors() {
+			m.Name = blk.Labels[0]
+			out.Etcd.Members = append(out.Etcd.Members, m)
+		}
 	case "ha":
 		diags = gohcl.DecodeBody(blk.Body, nil, &out.HA)
 	case "cni":
@@ -254,6 +269,9 @@ func (f *File) ApplyDefaults() {
 	}
 	if f.Etcd.Mode == "" {
 		f.Etcd.Mode = "stacked"
+	}
+	if f.Etcd.PKIDir == "" {
+		f.Etcd.PKIDir = "/etc/etcd/pki"
 	}
 	if f.HA.KubeVipImage == "" {
 		f.HA.KubeVipImage = "ghcr.io/kube-vip/kube-vip:latest"

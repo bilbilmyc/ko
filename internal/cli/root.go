@@ -47,6 +47,7 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(newNodeCmd())
 	root.AddCommand(newTuneCmd())
 	root.AddCommand(newClusterCmd())
+	root.AddCommand(newEtcdCmd())
 	root.AddCommand(newPackCmd())
 	root.AddCommand(newDashboardCmd())
 	root.AddCommand(newCompletionCmd())

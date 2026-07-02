@@ -320,8 +320,9 @@
 - [ ] S9 完：Dashboard 完成 install/node/tune/release/logs 主流程
 - [ ] S10 完：amd64 + arm64 e2e 都过
 - [ ] S11 完：v0.0.1 release tag 推送，CI release 流水线跑通
+- [x] S14 完：外部 etcd + mTLS + systemd + 8h 备份 全部跑通
 
-**v0.0.1 发布门**：S1–S11 全过 + SPEC §8 全部勾选。
+**v0.0.1 发布门**：S1–S11 + S14 全过 + SPEC §8 全部勾选。
 
 ---
 

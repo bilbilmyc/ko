@@ -34,6 +34,13 @@ type KubeadmOptions struct {
 	NodeIP              string
 	ImageRepository     string
 	CertificateValidity string // e.g. "876000h" — 100-year certs (S3 requirement)
+
+	// External etcd support (S14). When set, kubeadm init is invoked with
+	// --etcd-servers / --etcd-cafile / --etcd-certfile / --etcd-keyfile and
+	// NO local etcd member is created. PKI files are expected to be present
+	// on the master under EtcdPKIDir before Init runs.
+	EtcdServers string   // comma-separated https://host:2379 list
+	EtcdPKIDir  string   // on-master PKI directory (e.g. /etc/etcd/pki)
 }
 
 type Kubeadm struct {
@@ -72,6 +79,16 @@ func (k *Kubeadm) Init(ctx context.Context, host string, opts KubeadmOptions) (R
 	}
 	if opts.CertKey != "" {
 		args = append(args, "--certificate-key="+opts.CertKey)
+	}
+	if opts.EtcdServers != "" {
+		args = append(args, "--etcd-servers="+opts.EtcdServers)
+		if opts.EtcdPKIDir != "" {
+			args = append(args,
+				"--etcd-cafile="+opts.EtcdPKIDir+"/ca.crt",
+				"--etcd-certfile="+opts.EtcdPKIDir+"/client.crt",
+				"--etcd-keyfile="+opts.EtcdPKIDir+"/client.key",
+			)
+		}
 	}
 	args = append(args, opts.ExtraArgs...)
 	cmd := joinShellCmd(args)

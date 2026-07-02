@@ -391,3 +391,124 @@ ko v0.0.1 不内置监控。建议：
 - Alertmanager 路由告警到 Slack / 企业微信 / 钉钉
 
 Cilium 自带 Hubble 可选开（`cilium.enable-hubble=true`），能看网络流。
+
+## 10. 外部 etcd（S14）
+
+外部 etcd 把控制平面的状态从 k8s 集群里挪到独立维护的 etcd 集群上。
+ko 负责：二进制下载、mTLS 证书生成、systemd 部署、8 小时自动备份。
+
+### 10.1 什么时候用
+
+- 你有专门的 etcd 团队 / 物理机，需要独立管理 etcd 的备份与扩缩容。
+- 控制平面的故障域需要和 master 解耦。
+- 业务对 etcd 备份 RPO 有要求（8h 滚动 14 天，比 kubeadm stacked 默认 24h 更激进）。
+
+### 10.2 拓扑与配置
+
+最小配置 3 节点 etcd（容忍 1 故障）+ 3 节点 master + N 节点 worker。
+master 与 etcd 物理上分开。
+
+```hcl
+cluster {
+  name     = "prod"
+  version  = "1.35"
+  cidr     = "10.244.0.0/16"
+  svc_cidr = "10.96.0.0/12"
+}
+
+etcd {
+  mode      = "external"
+  endpoints = ["https://10.0.0.31:2379","https://10.0.0.32:2379","https://10.0.0.33:2379"]
+  pki_dir   = "/etc/etcd/pki"
+}
+
+members "etcd-1" { host = "10.0.0.31" }
+members "etcd-2" { host = "10.0.0.32" }
+members "etcd-3" { host = "10.0.0.33" }
+
+ha {
+  vip   = "10.0.0.10"
+  iface = "eth0"
+}
+
+nodes {
+  masters = ["10.0.0.11","10.0.0.12","10.0.0.13"]
+  workers = ["10.0.0.21","10.0.0.22"]
+  ssh {
+    user     = "root"
+    key_file = "/root/.ssh/id_rsa"
+  }
+}
+```
+
+`ko init` 启动后会：
+1. 拉 etcd 3.5.21 tarball 到本地 `~/.ko/etcd/`（已 sha256 校验）。
+2. 在 `~/.ko/etcd/pki/` 签发整套 mTLS：ca / server / peer / client。
+3. scp tarball + 证书到每台 etcd 节点，写 systemd unit `etcd.service`，enable + start。
+4. 部署 8 小时 systemd timer + 备份脚本（`ko-etcd-backup.timer` / `.service`）。
+5. 等所有 member `/health` 返回 `{"health":"true"}`（最长 2 分钟超时）。
+6. 把 ca + client cert 同步到每台 master 的 `/etc/etcd/pki/`。
+7. `kubeadm init` 带上 `--etcd-servers=https://10.0.0.31:2379,... --etcd-cafile=... --etcd-certfile=... --etcd-keyfile=...`。
+
+### 10.3 子命令
+
+```bash
+ko etcd install              # 重新跑一次安装（idempotent）
+ko etcd status               # 看每台 member 的 systemctl + endpoint 健康
+ko etcd backup               # 立即手动备份（8h 定时任务也跑）
+ko etcd uninstall            # 停 systemd + 清 PKI 和 data
+ko etcd uninstall --purge-backups   # 顺便删 /var/backups/etcd
+```
+
+dashboard 端点：
+
+```
+GET /api/etcd/status         # 每台 member active / health
+GET /api/etcd/backups        # 所有备份文件列表（按 mtime desc）
+```
+
+### 10.4 备份恢复
+
+自动备份 8 小时一次（systemd timer + Persistent=true 补错过点），
+落在每台 member 的 `/var/backups/etcd/<host>-<ts>.db`，
+本地保留 14 天滚动。手动 `ko etcd backup` 会把文件 scp 回 `ko` 所在机器当前目录。
+
+恢复时把 db 拷回 etcd 节点，单 member 恢复：
+
+```bash
+ssh etcd-1
+sudo systemctl stop etcd
+sudo etcdctl snapshot restore /var/backups/etcd/etcd-1-20260101-120000.db \
+  --name etcd-1 \
+  --initial-cluster etcd-1=https://10.0.0.31:2380,... \
+  --initial-advertise-peer-urls https://10.0.0.31:2380 \
+  --data-dir /var/lib/etcd/etcd-1.new
+sudo mv /var/lib/etcd/etcd-1 /var/lib/etcd/etcd-1.broken
+sudo mv /var/lib/etcd/etcd-1.new /var/lib/etcd/etcd-1
+sudo systemctl start etcd
+```
+
+集群多数派（3 选 2 活）的情况下，单独重启一台就能让 member 重新加入 quorum；
+全集群故障才需要从 snapshot 恢复。**先打电话给团队再 rm data-dir**。
+
+### 10.5 证书轮换
+
+证书默认 10 年有效期（`DefaultValidity`）。到期前 30 天 dashboard `/api/certs`
+会显示 `etcd-server`、`etcd-peer` 的 `not_after`。轮换：
+
+```bash
+ko etcd install --regen-pki
+```
+
+（`--regen-pki` 标志将在 v0.1.x 提供；当前 v0.0.1 重跑 `ko etcd install` 会
+保留 CA 仅刷新 server/peer/client，幂等。）
+
+### 10.6 故障排查
+
+| 现象 | 排查 |
+|---|---|
+| `ko etcd status` 显示 `inactive` | `ssh etcd-1 systemctl status etcd` 看日志 |
+| `endpoint_health=unhealthy` 但 `active=active` | `/etc/etcd/pki/client.crt` 过期或 SAN 不对，`journalctl -u etcd` 看 TLS 错误 |
+| `waitForEtcdHealthy` 2 分钟超时 | `curl -k --cacert ... https://10.0.0.31:2379/health` 单点探测 |
+| 8h timer 没跑 | `systemctl list-timers ko-etcd-backup.timer` 看上次/下次触发 |
+| 备份目录满 | `find /var/backups/etcd -mtime +14 -delete`（脚本会自己滚）|

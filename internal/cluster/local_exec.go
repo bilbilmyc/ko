@@ -53,12 +53,12 @@ func (l *LocalExecutor) Run(ctx context.Context, host, command string) execx.Res
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	res.Stdout = stdout.Bytes()
-	res.Stderr = stderr.Bytes()
 
 	if err := cmd.Run(); err != nil {
 		res.Err = fmt.Errorf("run: %w (stderr: %s)", err, stderr.String())
 	}
+	res.Stdout = stdout.Bytes()
+	res.Stderr = stderr.Bytes()
 	return res
 }
 

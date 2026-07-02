@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/ko-build/ko/internal/ciliumconfig"
 	"github.com/ko-build/ko/internal/containerd"
@@ -110,6 +111,15 @@ func (i *Init) Run(ctx context.Context, masterHost string) error {
 			return fmt.Errorf("bootstrap kubeadm on %s: %w", h, err)
 		}
 	}
+	// S14: when the user opted into an external etcd cluster, we install
+	// the etcd members, generate the PKI, and distribute the client certs
+	// to every master BEFORE kubeadm init runs. kubeadm then sees
+	// --etcd-servers=... and skips its own local etcd.
+	if IsExternalEtcd(i.Cfg) {
+		if err := ProvisionExternalEtcd(ctx, i.Cfg, i.Exec, i.masters()); err != nil {
+			return err
+		}
+	}
 	if err := i.runKubeadmInit(ctx, masterHost); err != nil {
 		return err
 	}
@@ -193,6 +203,12 @@ func (i *Init) runKubeadmInit(ctx context.Context, host string) error {
 	}
 	if i.Cfg.HA.VIP != "" {
 		opts.APIServerEndpoint = i.Cfg.HA.VIP + ":6443"
+	}
+	// S14: when external etcd mode is in use, feed kubeadm the endpoints
+	// + the on-master PKI directory that ProvisionExternalEtcd populated.
+	if IsExternalEtcd(i.Cfg) {
+		opts.EtcdServers = strings.Join(i.Cfg.Etcd.Endpoints, ",")
+		opts.EtcdPKIDir = i.Cfg.Etcd.PKIDir
 	}
 	_, err := i.Kubeadm.Init(ctx, host, opts)
 	return err
