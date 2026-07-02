@@ -424,16 +424,13 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 - ✅ **NFS / 文件共享挂载**（#60 已完成）— 所有集群节点挂载同一份 NFS（如 `/mnt/ko-store/`），bundle 直接放文件系统。`ko init --bundle /mnt/ko-store/bundle-k8s1.32.0-cilium1.16.1-20260702-multi.oci.tar.gz`。
 - ✅ **单 tar 交付物**（#61 已完成）— `ko pack ship --output delivery.tar.gz --bundle /mnt/ko-store/<bundle-name>.oci.tar.gz --include-configs` 打一份 tar（含 `ko` 二进制 + 指定 bundle + 三个 profile 模板），运维解压即用。
 - ✅ **强制离线**（#64 待做）— `ko init` / `ko node add` 必须带 `--offline --bundle <path>`；不带就报错退出。开发自测在线场景用 `--allow-online` flag 跳过。
-
-**仍待拍**：
-
-- [ ] **(iv) bundle 版本号命名约定**（#63 待做）— 推荐 `bundle-k8s<X.Y.Z>-cilium<X.Y.Z>-<YYYYMMDD>-<arch>.oci.tar.gz`，运维一眼看出内容 + 日期 + 架构。**待用户确认**。
+- ✅ **(iv) bundle 版本号命名约定**（#63 完成）— `bundle-k8s<X.Y.Z>-cilium<X.Y.Z>-<YYYYMMDD>-<arch>.oci.tar.gz`（例：`bundle-k8s1.32.0-cilium1.16.1-20260702-multi.oci.tar.gz`）。`internal/cli/pack.go` 默认 bundle 名按此格式生成（基于 k8s/cilium 当前常量 + 当天日期），用户可用 `--version` override。
 
 **执行步骤**（每条独立可验证）：
 
+- [x] **(γ) #63 bundle 命名约定落地（代码）** — `internal/cli/pack.go` 新增 `defaultBundleName(k8s, cilium string) string` helper；默认 `--version` 从 `"v0.0.1"` 改成 `defaultBundleName(...)`。单元测试覆盖（`internal/cli/pack_test.go`）。
 - [ ] **(α) #64 强制离线（代码）** — `internal/cli/init.go` 和 `internal/cli/node.go` 加：检测 `!cmd.Flags().Changed("offline")` 时 `return fmt.Errorf("纯离线项目，ko init 必须带 --offline --bundle <path>（开发自测用 --allow-online 跳过）")`。同步加 `--allow-online` flag。单元测试覆盖。
 - [ ] **(β) `ko pack ship` 命令**（#65 待创建）— 新增 `internal/cli/pack.go::newPackShipCmd`，把 ko 二进制 + bundle + 三个 profile 模板（single / ha / external-etcd）打成一个 tar。命令格式见上文。RUNBOOK §1.5 引用。
-- [ ] **(γ) #63 bundle 命名约定**（待用户拍）— 拍后更新 `internal/image/upstream.go` 里默认 bundle 名生成逻辑（如果用日期戳）；RUNBOOK §1.5 引用。
 - [ ] **(δ) RUNBOOK §1.5 + README 离线示例** 改 NFS 路径 + delivery tar — 见 #62 子任务。
 
 ### 8.7 代码 / 决策锚点（防止后续 session 想"为什么这么写"）

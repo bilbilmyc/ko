@@ -9,12 +9,42 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ko-build/ko/internal/image"
 	"github.com/ko-build/ko/internal/logger"
 )
+
+// Default k8s / cilium versions baked into the bundle. These are the
+// source of truth for both `gatherLayers` (which pulls images at these
+// versions) and the default bundle name (`defaultBundleName`).
+const (
+	defaultK8sVersion    = "v1.32.0"
+	defaultCiliumVersion = "1.16.1"
+)
+
+// defaultBundleName returns the default `--version` value used when
+// the operator doesn't pass one. Format:
+//
+//	bundle-k8s<MAJOR.MINOR.PATCH>-cilium<MAJOR.MINOR.PATCH>-YYYYMMDD
+//
+// Examples:
+//
+//	bundle-k8s1.32.0-cilium1.16.1-20260702  (used with --arch amd64 → ...-amd64.oci.tar.gz)
+//	bundle-k8s1.32.0-cilium1.16.1-20260702  (used with --arch all   → ...-multi.oci.tar.gz)
+//
+// The k8s / cilium version strings may carry a leading `v` (kubeadm
+// convention); strip it for the filename so `v1.32.0` and `1.32.0` both
+// render as `k8s1.32.0`.
+func defaultBundleName(k8sVer, ciliumVer string, t time.Time) string {
+	strip := func(s string) string { return strings.TrimPrefix(s, "v") }
+	return fmt.Sprintf("bundle-k8s%s-cilium%s-%s",
+		strip(k8sVer), strip(ciliumVer),
+		t.UTC().Format("20060102"))
+}
 
 func newPackCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -43,7 +73,14 @@ images) and packs them into a sealos-style OCI image-layout tar.gz.
   --arch all      Multi-arch image index (amd64 + arm64 in one tar.gz)
 
 Multi-arch dedups identical layer blobs across arches. The output filename
-embeds the arch (single-arch) or ends in -multi.oci.tar.gz (multi-arch).`,
+embeds the arch (single-arch) or ends in -multi.oci.tar.gz (multi-arch).
+
+The bundle is versioned independently of ko itself. Default --version is
+
+  bundle-k8s<X.Y.Z>-cilium<X.Y.Z>-<YYYYMMDD>
+
+(format: defaultBundleName). Override via --version to bake an explicit
+name; the value becomes the filename prefix verbatim.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if arch == "" {
 				arch = "amd64"
@@ -52,7 +89,7 @@ embeds the arch (single-arch) or ends in -multi.oci.tar.gz (multi-arch).`,
 				outputDir = filepath.Join(homeDir(), ".ko", "bundles")
 			}
 			if version == "" {
-				version = "v0.0.1"
+				version = defaultBundleName(defaultK8sVersion, defaultCiliumVersion, time.Now())
 			}
 			cacheDir := cacheHome()
 
@@ -64,7 +101,8 @@ embeds the arch (single-arch) or ends in -multi.oci.tar.gz (multi-arch).`,
 	}
 	cmd.Flags().StringVar(&arch, "arch", "amd64", "target architecture: amd64 | arm64 | all")
 	cmd.Flags().StringVar(&outputDir, "output", "", "output directory (default ~/.ko/bundles)")
-	cmd.Flags().StringVar(&version, "version", "v0.0.1", "ko version tag")
+	cmd.Flags().StringVar(&version, "version", "",
+		"bundle version tag (default: bundle-k8s<>-cilium<>-<YYYYMMDD>)")
 	return cmd
 }
 
@@ -121,12 +159,8 @@ func buildMultiArch(cmd *cobra.Command, cacheDir, outputDir, version string) err
 // the cilium helm chart for a single arch. Errors fetching a single source
 // are downgraded to warnings so a flaky network doesn't block the whole
 // pack; the caller validates len(layers) > 0. Defaults are pinned to the
-// versions ko's other components expect (k8s v1.32.0, cilium v1.16.1).
+// versions ko's other components expect (defaultK8sVersion, defaultCiliumVersion).
 func gatherLayers(cmd *cobra.Command, dl *image.UpstreamDownloader, cacheDir, arch string) ([]image.LayerSource, error) {
-	const (
-		k8sVersion    = "v1.32.0"
-		ciliumVersion = "1.16.1"
-	)
 	layers := []image.LayerSource{}
 
 	ctd, err := dl.Containerd(cmd.Context(), "v2.0.5", arch)
@@ -138,7 +172,7 @@ func gatherLayers(cmd *cobra.Command, dl *image.UpstreamDownloader, cacheDir, ar
 		})
 	}
 
-	kub, err := dl.Kubeadm(cmd.Context(), k8sVersion, arch)
+	kub, err := dl.Kubeadm(cmd.Context(), defaultK8sVersion, arch)
 	if err != nil {
 		logger.Warn("kubeadm download failed (skipping)", "arch", arch, "err", err)
 	} else {
@@ -147,7 +181,7 @@ func gatherLayers(cmd *cobra.Command, dl *image.UpstreamDownloader, cacheDir, ar
 		})
 	}
 
-	k8sTar, err := dl.K8sImagesTar(cmd.Context(), k8sVersion, arch)
+	k8sTar, err := dl.K8sImagesTar(cmd.Context(), defaultK8sVersion, arch)
 	if err != nil {
 		logger.Warn("k8s images pack failed (skipping)", "arch", arch, "err", err)
 	} else {
@@ -165,7 +199,7 @@ func gatherLayers(cmd *cobra.Command, dl *image.UpstreamDownloader, cacheDir, ar
 		})
 	}
 
-	chart, err := dl.CiliumChartTGZ(cmd.Context(), ciliumVersion)
+	chart, err := dl.CiliumChartTGZ(cmd.Context(), defaultCiliumVersion)
 	if err != nil {
 		logger.Warn("cilium chart download failed (skipping)", "arch", arch, "err", err)
 	} else {
@@ -174,7 +208,7 @@ func gatherLayers(cmd *cobra.Command, dl *image.UpstreamDownloader, cacheDir, ar
 		})
 	}
 
-	ciliumImgs, err := dl.CiliumImagesTar(cmd.Context(), ciliumVersion)
+	ciliumImgs, err := dl.CiliumImagesTar(cmd.Context(), defaultCiliumVersion)
 	if err != nil {
 		logger.Warn("cilium images pack failed (skipping)", "arch", arch, "err", err)
 	} else {
