@@ -57,8 +57,6 @@ jobs:
           files: |
             bin/ko-linux-amd64
             bin/ko-linux-arm64
-            dist/ko-multi.oci.tar.gz
-            dist/ko-*-amd64.oci.tar.gz
-            dist/ko-*-arm64.oci.tar.gz
+            dist/*.oci.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
