@@ -307,8 +307,14 @@ func (n *NodeLifecycle) apiServerEndpoint() string {
 }
 
 func (n *NodeLifecycle) criSocket(host string) string {
+	// k8s ≥ 1.24 dropped the in-tree dockershim — kubelet talks to the CRI
+	// via a CRI endpoint, not the docker engine socket. The docker runtime
+	// path therefore goes through cri-dockerd (Mirantis). containerd is its
+	// own CRI endpoint. The docker engine socket at /var/run/docker.sock is
+	// still where `docker` CLI / `crictl` (when configured for docker) lives,
+	// but kubelet will hang forever pointing at it.
 	if n.Cfg.LookupNodeOverride(host) != nil && n.Cfg.LookupNodeOverride(host).Runtime == "docker" {
-		return "unix:///var/run/docker.sock"
+		return "unix:///run/cri-dockerd/cri-dockerd.sock"
 	}
 	return "unix:///run/containerd/containerd.sock"
 }

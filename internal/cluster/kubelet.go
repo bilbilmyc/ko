@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/ko-build/ko/pkg/config"
 )
 
 // kubeletDropInPath is the systemd drop-in ko writes to override the kubelet
@@ -11,7 +13,15 @@ import (
 // (per the kubeadm convention) and override Environment=KUBELET_KUBEADM_ARGS.
 const kubeletDropInPath = "/etc/systemd/system/kubelet.service.d/20-ko-offline.conf"
 
-// KubeletDropIn returns the contents of the ko kubelet drop-in.
+// criDockerdEndpoint is the CRI socket cri-dockerd (Mirantis) listens on
+// once it's running. Used as --container-runtime-endpoint for kubelet
+// when the per-node runtime is docker — k8s ≥ 1.24 dropped the in-tree
+// dockershim, so kubelet can't talk to dockerd directly anymore.
+const criDockerdEndpoint = "unix:///run/cri-dockerd/cri-dockerd.sock"
+
+// KubeletDropIn returns the contents of the ko kubelet drop-in for the
+// given runtime. Pass runtime="" to get the containerd default; "docker"
+// appends --container-runtime-endpoint pointing at cri-dockerd.
 //
 // v0.0.5: kubelet in an airgap cluster has very different needs from the
 // kubeadm defaults:
@@ -32,11 +42,17 @@ const kubeletDropInPath = "/etc/systemd/system/kubelet.service.d/20-ko-offline.c
 // We render the drop-in as a heredoc'd Environment line so the existing
 // resetScript can remove it with `rm -rf /etc/systemd/system/kubelet.service.d`
 // (idempotent — works whether or not the drop-in was ever written).
-func KubeletDropIn() string {
-	const args = "--image-pull-progress-deadline=30m" +
+func KubeletDropIn(runtime string) string {
+	args := "--image-pull-progress-deadline=30m" +
 		" --registry-qps=5" +
 		" --registry-burst=10" +
 		" --eviction-hard=memory.available<100Mi,nodefs.available<10%"
+	// v0.0.5+: docker runtime → kubelet talks to cri-dockerd, not dockerd.
+	// k8s ≥ 1.24 removed the in-tree dockershim, so without this kubelet
+	// can't see docker containers at all.
+	if runtime == "docker" {
+		args += " --container-runtime-endpoint=" + criDockerdEndpoint
+	}
 	return "[Service]\n" +
 		"Environment=\"KUBELET_KUBEADM_ARGS=" + args + "\"\n"
 }
@@ -50,7 +66,19 @@ func KubeletDropIn() string {
 // We `systemctl daemon-reload` so kubelet picks up the new Environment on
 // the next restart (kubeadm init / join will do that restart on its own).
 func WriteKubeletDropIn(ctx context.Context, exec Executor, host string) error {
-	content := KubeletDropIn()
+	runtime := ""
+	if cfg := currentRuntimeForHost(host); cfg != "" {
+		runtime = cfg
+	}
+	return writeKubeletDropInWithRuntime(ctx, exec, host, runtime)
+}
+
+// writeKubeletDropInWithRuntime is the runtime-aware variant — called
+// directly by PrepareHostFromBundle so the docker-runtime path picks up
+// the cri-dockerd endpoint flag without leaking global state through
+// WriteKubeletDropIn's signature.
+func writeKubeletDropInWithRuntime(ctx context.Context, exec Executor, host, runtime string) error {
+	content := KubeletDropIn(runtime)
 	script := fmt.Sprintf(`set -euo pipefail
 mkdir -p /etc/systemd/system/kubelet.service.d
 cat > %s <<'KO_KUBELET_EOF'
@@ -75,6 +103,47 @@ func writeKubeletDropInAll(ctx context.Context, exec Executor, hosts []string) e
 		}
 	}
 	return nil
+}
+
+// currentRuntimeForHost is a thin shim around the cfg that lets WriteKubeletDropIn
+// stay free of cfg plumbing while still rendering the right drop-in per node.
+// Returns "" when no docker override is set, so the kubelet drop-in matches
+// the default containerd CRI.
+func currentRuntimeForHost(host string) string {
+	// We can't import the full Cfg without making WriteKubeletDropIn take
+	// a *config.File; instead we lean on a package-level var that the
+	// caller (NodeLifecycle / OfflineRunner) is expected to set before
+	// any per-host drop-in is written. This is set by
+	// OfflineRunner.Run / PrepareHostFromBundle via SetClusterCfg.
+	c := clusterCfg
+	if c == nil {
+		return ""
+	}
+	override := c.LookupNodeOverride(host)
+	if override != nil && override.Runtime == "docker" {
+		return "docker"
+	}
+	return ""
+}
+
+// clusterCfg is the package-level handle into the config so legacy
+// callers of WriteKubeletDropIn (which takes only host/exec) still get a
+// runtime-aware drop-in. Set by SetClusterCfg from the CLI / NodeLifecycle
+// before any per-node drop-in write.
+var clusterCfg nodeOverrideLookup
+
+// nodeOverrideLookup is the minimal surface kubelet.go needs from the
+// cluster config to render a per-runtime drop-in. *config.File satisfies
+// it via LookupNodeOverride; tests can inject a fake without pulling the
+// hcl-validated config struct.
+type nodeOverrideLookup interface {
+	LookupNodeOverride(host string) *config.NodesOverrideBlock
+}
+
+// SetClusterCfg registers the cluster config that WriteKubeletDropIn
+// consults to render a per-runtime drop-in. Pass nil to clear.
+func SetClusterCfg(c nodeOverrideLookup) {
+	clusterCfg = c
 }
 
 // assertKubeletDropInPath is a self-test that the path constant is what we

@@ -16,14 +16,7 @@ import (
 
 	"github.com/ko-build/ko/internal/image"
 	"github.com/ko-build/ko/internal/logger"
-)
-
-// Default k8s / cilium versions baked into the bundle. These are the
-// source of truth for both `gatherLayers` (which pulls images at these
-// versions) and the default bundle name (`defaultBundleName`).
-const (
-	defaultK8sVersion    = "v1.32.0"
-	defaultCiliumVersion = "1.16.1"
+	"github.com/ko-build/ko/internal/version"
 )
 
 // defaultBundleName returns the default `--version` value used when
@@ -60,13 +53,16 @@ func newPackBuildCmd() *cobra.Command {
 	var (
 		arch      string
 		outputDir string
-		version   string
+		ver       string
+		vendorDir string
 	)
 	cmd := &cobra.Command{
 		Use:   "build",
 		Short: "Build an offline OCI bundle (single-arch or multi-arch)",
-		Long: `build fetches vendor artifacts (containerd tarball, helm charts, k8s
-images) and packs them into a sealos-style OCI image-layout tar.gz.
+		Long: `build reads pre-vendored assets from third_party/ (binaries, image
+archives, helm charts) and packs them into a sealos-style OCI image-layout
+tar.gz. ZERO network at build time — every binary and image was placed in
+third_party/ by ` + "`ko vendor fetch`" + `.
 
   --arch amd64    Single-arch bundle (default)
   --arch arm64    Single-arch bundle
@@ -88,35 +84,39 @@ name; the value becomes the filename prefix verbatim.`,
 			if outputDir == "" {
 				outputDir = filepath.Join(homeDir(), ".ko", "bundles")
 			}
-			if version == "" {
-				version = defaultBundleName(defaultK8sVersion, defaultCiliumVersion, time.Now())
+			if ver == "" {
+				ver = defaultBundleName(version.KubeVersion, version.CiliumVersion, time.Now())
 			}
-			cacheDir := cacheHome()
+			if vendorDir == "" {
+				vendorDir = vendorHome()
+			}
 
 			if arch == "all" {
-				return buildMultiArch(cmd, cacheDir, outputDir, version)
+				return buildMultiArch(cmd, vendorDir, outputDir, ver)
 			}
-			return buildSingleArch(cmd, cacheDir, arch, outputDir, version)
+			return buildSingleArch(cmd, vendorDir, arch, outputDir, ver)
 		},
 	}
 	cmd.Flags().StringVar(&arch, "arch", "amd64", "target architecture: amd64 | arm64 | all")
 	cmd.Flags().StringVar(&outputDir, "output", "", "output directory (default ~/.ko/bundles)")
-	cmd.Flags().StringVar(&version, "version", "",
+	cmd.Flags().StringVar(&ver, "version", "",
 		"bundle version tag (default: bundle-k8s<>-cilium<>-<YYYYMMDD>)")
+	cmd.Flags().StringVar(&vendorDir, "vendor-dir", "",
+		"path to third_party/ (default: project root / third_party); populated by `ko vendor fetch`")
 	return cmd
 }
 
-func buildSingleArch(cmd *cobra.Command, cacheDir, arch, outputDir, version string) error {
-	dl := image.NewUpstream(cacheDir)
-	layers, err := gatherLayers(cmd, dl, cacheDir, arch)
+func buildSingleArch(cmd *cobra.Command, vendorDir, arch, outputDir, ver string) error {
+	dl := image.NewUpstream(vendorDir)
+	layers, err := gatherLayers(cmd, dl, arch)
 	if err != nil {
 		return err
 	}
 	if len(layers) == 0 {
-		return fmt.Errorf("no layers produced — check connectivity and try again")
+		return fmt.Errorf("no layers produced — run `ko vendor fetch` to populate third_party/")
 	}
 	out, descs, err := image.Build(image.BuildOpts{
-		Arch: arch, Version: version, Layers: layers, OutputDir: outputDir,
+		Arch: arch, Version: ver, Layers: layers, OutputDir: outputDir,
 	})
 	if err != nil {
 		return err
@@ -128,11 +128,11 @@ func buildSingleArch(cmd *cobra.Command, cacheDir, arch, outputDir, version stri
 	return nil
 }
 
-func buildMultiArch(cmd *cobra.Command, cacheDir, outputDir, version string) error {
-	dl := image.NewUpstream(cacheDir)
+func buildMultiArch(cmd *cobra.Command, vendorDir, outputDir, ver string) error {
+	dl := image.NewUpstream(vendorDir)
 	images := make([]image.ArchImage, 0, 2)
 	for _, arch := range []string{"amd64", "arm64"} {
-		layers, err := gatherLayers(cmd, dl, cacheDir, arch)
+		layers, err := gatherLayers(cmd, dl, arch)
 		if err != nil {
 			return err
 		}
@@ -142,7 +142,7 @@ func buildMultiArch(cmd *cobra.Command, cacheDir, outputDir, version string) err
 		images = append(images, image.ArchImage{Arch: arch, Layers: layers})
 	}
 	res, err := image.BuildMulti(image.MultiBuildOpts{
-		Version: version, OutputDir: outputDir, Images: images,
+		Version: ver, OutputDir: outputDir, Images: images,
 	})
 	if err != nil {
 		return err
@@ -155,87 +155,83 @@ func buildMultiArch(cmd *cobra.Command, cacheDir, outputDir, version string) err
 	return nil
 }
 
-// gatherLayers fetches containerd, kubeadm, k8s images, registry image and
-// the cilium helm chart for a single arch. Errors fetching a single source
-// are downgraded to warnings so a flaky network doesn't block the whole
-// pack; the caller validates len(layers) > 0. Defaults are pinned to the
-// versions ko's other components expect (defaultK8sVersion, defaultCiliumVersion).
+// gatherLayers reads pre-vendored assets from third_party/ via dl (no
+// network) and turns each into a LayerSource for the bundle. Errors
+// fetching a single source are downgraded to warnings so a missing
+// optional layer (e.g. docker .deb dropped manually) doesn't block the
+// whole pack; the caller validates len(layers) > 0.
 //
-// containerd and docker versions are NOT pinned — we ask the GitHub API
-// for the latest non-prerelease tag at pack time, so airgap installs track
-// upstream stable automatically. The latest-tag lookup is cached under
-// ~/.ko/cache for 24h so repeat builds don't hammer the GitHub API.
-// Operator can still pin via HCL or --containerd-version / --docker-version.
-func gatherLayers(cmd *cobra.Command, dl *image.UpstreamDownloader, cacheDir, arch string) ([]image.LayerSource, error) {
+// All asset versions are pinned via internal/version (mirrored in
+// vendor-versions.env for the fetch script).
+func gatherLayers(cmd *cobra.Command, dl *image.UpstreamDownloader, arch string) ([]image.LayerSource, error) {
 	layers := []image.LayerSource{}
-
-	ctdVersion, err := dl.LatestContainerdVersion(cmd.Context())
-	if err != nil {
-		logger.Warn("containerd latest-tag lookup failed; falling back to v2.1.0", "err", err)
-		ctdVersion = "v2.1.0"
+	add := func(srcPath, mediaType, label string) {
+		if srcPath == "" {
+			return
+		}
+		logger.Info("layer", "kind", label, "arch", arch, "src", srcPath)
+		layers = append(layers, image.LayerSource{SrcPath: srcPath, MediaType: mediaType})
 	}
-	logger.Info("containerd version for bundle", "version", ctdVersion)
-	ctd, err := dl.Containerd(cmd.Context(), ctdVersion, arch)
-	if err != nil {
-		logger.Warn("containerd download failed (skipping)", "arch", arch, "version", ctdVersion, "err", err)
-	} else {
-		layers = append(layers, image.LayerSource{
-			SrcPath: ctd, MediaType: image.MediaTypeKoContainerdTar,
-		})
-	}
-
-	kub, err := dl.Kubeadm(cmd.Context(), defaultK8sVersion, arch)
-	if err != nil {
-		logger.Warn("kubeadm download failed (skipping)", "arch", arch, "err", err)
-	} else {
-		layers = append(layers, image.LayerSource{
-			SrcPath: kub, MediaType: image.MediaTypeKoKubeadmBinary,
-		})
+	mustOK := func(err error) bool {
+		if err != nil {
+			logger.Warn("vendored asset missing (skipping)", "err", err)
+			return false
+		}
+		return true
 	}
 
-	k8sTar, err := dl.K8sImagesTar(cmd.Context(), defaultK8sVersion, arch)
-	if err != nil {
-		logger.Warn("k8s images pack failed (skipping)", "arch", arch, "err", err)
-	} else {
-		layers = append(layers, image.LayerSource{
-			SrcPath: k8sTar, MediaType: image.MediaTypeKoK8sImagesTar,
-		})
+	// containerd (binary tarball)
+	if p, err := dl.Containerd(version.ContainerdVersion, arch); mustOK(err) {
+		add(p, image.MediaTypeKoContainerdTar, "containerd")
 	}
-
-	reg, err := dl.RegistryImage(cmd.Context(), arch)
-	if err != nil {
-		logger.Warn("registry image pack failed (skipping)", "arch", arch, "err", err)
-	} else {
-		layers = append(layers, image.LayerSource{
-			SrcPath: reg, MediaType: image.MediaTypeKoRegistryImage,
-		})
+	// kubeadm
+	if p, err := dl.Kubeadm(version.KubeVersion, arch); mustOK(err) {
+		add(p, image.MediaTypeKoKubeadmBinary, "kubeadm")
 	}
-
-	regBin, err := dl.RegistryBinary(cmd.Context(), image.DefaultRegistryVersion, arch)
-	if err != nil {
-		logger.Warn("registry binary pack failed (skipping)", "arch", arch, "err", err)
-	} else {
-		layers = append(layers, image.LayerSource{
-			SrcPath: regBin, MediaType: image.MediaTypeKoRegistryBinary,
-		})
+	// kubelet
+	if p, err := dl.Kubelet(version.KubeVersion, arch); mustOK(err) {
+		add(p, image.MediaTypeKoKubeletBinary, "kubelet")
 	}
-
-	chart, err := dl.CiliumChartTGZ(cmd.Context(), defaultCiliumVersion)
-	if err != nil {
-		logger.Warn("cilium chart download failed (skipping)", "arch", arch, "err", err)
-	} else {
-		layers = append(layers, image.LayerSource{
-			SrcPath: chart, MediaType: image.MediaTypeKoHelmChart,
-		})
+	// cri-dockerd
+	if p, err := dl.CRIDockerd(version.CRIDockerdVersion, arch); mustOK(err) {
+		add(p, image.MediaTypeKoCRIDockerdBinary, "cri-dockerd")
 	}
-
-	ciliumImgs, err := dl.CiliumImagesTar(cmd.Context(), defaultCiliumVersion)
-	if err != nil {
-		logger.Warn("cilium images pack failed (skipping)", "arch", arch, "err", err)
-	} else {
-		layers = append(layers, image.LayerSource{
-			SrcPath: ciliumImgs, MediaType: image.MediaTypeKoCiliumImagesTar,
-		})
+	// docker static tgz (always; needed for manual `dockerd` install on
+	// distros without working apt/dnf in the airgap env)
+	if p, err := dl.DockerStatic(version.DockerVersion, arch); mustOK(err) {
+		add(p, "application/vnd.ko.layer.docker.static.tgz.v1", "docker-static")
+	}
+	// docker .deb / .rpm (optional — only present if operator dropped
+	// the package into third_party/docker/{deb,rpm}/<arch>/). Not
+	// required for the airgap path (static tgz + manual install works);
+	// emit the layer if present, skip silently otherwise.
+	if p, err := dl.DockerDeb(arch); err == nil {
+		add(p, image.MediaTypeKoDockerDeb, "docker-deb")
+	}
+	if p, err := dl.DockerRPM(arch); err == nil {
+		add(p, image.MediaTypeKoDockerRPM, "docker-rpm")
+	}
+	// k8s control plane image tar
+	if p, err := dl.K8sImagesTar(version.KubeVersion, arch); mustOK(err) {
+		add(p, image.MediaTypeKoK8sImagesTar, "k8s-images")
+	}
+	// cilium images + chart
+	if p, err := dl.CiliumImagesTar(version.CiliumVersion); mustOK(err) {
+		add(p, image.MediaTypeKoCiliumImagesTar, "cilium-images")
+	}
+	if p, err := dl.CiliumChartTGZ(version.CiliumVersion); mustOK(err) {
+		add(p, image.MediaTypeKoHelmChart, "cilium-chart")
+	}
+	// prometheus stack images + chart
+	if p, err := dl.PrometheusImagesTar(version.PrometheusStackVersion); mustOK(err) {
+		add(p, image.MediaTypeKoPrometheusImagesTar, "prometheus-images")
+	}
+	if p, err := dl.PrometheusChartTGZ(version.PrometheusStackVersion); mustOK(err) {
+		add(p, image.MediaTypeKoPrometheusChart, "prometheus-chart")
+	}
+	// registry (static Go binary, runs as ko-registry.service on master-1)
+	if p, err := dl.RegistryBinary(version.RegistryVersion, arch); mustOK(err) {
+		add(p, image.MediaTypeKoRegistryBinary, "registry-binary")
 	}
 	return layers, nil
 }
@@ -334,4 +330,15 @@ func cacheHome() string {
 		return h
 	}
 	return filepath.Join(homeDir(), ".ko", "cache")
+}
+
+// vendorHome returns the default third_party/ root used by `ko pack
+// build` and `ko vendor fetch`. KO_VENDOR_DIR overrides it for CI /
+// sandbox runs. Default is the project's third_party/ (resolved from
+// the current working directory) — fetch-vendor.sh populates it.
+func vendorHome() string {
+	if h := os.Getenv("KO_VENDOR_DIR"); h != "" {
+		return h
+	}
+	return filepath.Join("third_party")
 }

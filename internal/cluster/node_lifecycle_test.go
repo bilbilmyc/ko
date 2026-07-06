@@ -68,7 +68,9 @@ func TestNodeLifecycle_Remove_DockerCRI(t *testing.T) {
 	require.NoError(t, n.Remove(context.Background(), "w1", RemoveOptions{Force: true}))
 	for _, c := range mock.Calls {
 		if strings.Contains(c.Command, "kubeadm reset") {
-			assert.Contains(t, c.Command, "unix:///var/run/docker.sock")
+			assert.Contains(t, c.Command, "unix:///run/cri-dockerd/cri-dockerd.sock")
+			assert.NotContains(t, c.Command, "unix:///var/run/docker.sock",
+				"docker runtime must use cri-dockerd socket, NOT docker engine socket (dockershim was removed in k8s ≥ 1.24)")
 		}
 	}
 }

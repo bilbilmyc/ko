@@ -49,6 +49,7 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(newClusterCmd())
 	root.AddCommand(newEtcdCmd())
 	root.AddCommand(newPackCmd())
+	root.AddCommand(newVendorCmd())
 	root.AddCommand(newDashboardCmd())
 	root.AddCommand(newCompletionCmd())
 

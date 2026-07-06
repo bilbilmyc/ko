@@ -387,3 +387,128 @@ func extractTarGz(src, dest string) error {
 		}
 	}
 }
+
+// TestOfflineRunner_InstallCRIDockerdFromBundle_BundlesHardenedUnit
+// pins the k8s ≥ 1.24 dockershim-removal fix: the install script must
+// (a) extract the binary to /usr/local/bin/cri-dockerd with mode 0755,
+// (b) write a hardened systemd unit, (c) enable --now it, (d) verify
+// the socket appears within 10s. A regression on any of these means
+// docker-runtime nodes won't be able to join an airgap cluster.
+func TestOfflineRunner_InstallCRIDockerdFromBundle_BundlesHardenedUnit(t *testing.T) {
+	exec := NewMockExecutor()
+	defer exec.Close()
+	exec.RunFn = func(_ context.Context, host, command string) Result {
+		return Result{Host: host, Command: command, Stdout: []byte("ok")}
+	}
+	r := &OfflineRunner{Cfg: &config.File{}, Exec: exec}
+	l := &layerPaths{CRIDockerd: "/var/lib/ko/bundle/cri-dockerd-layer.tar.gz"}
+	require.NoError(t, r.InstallCRIDockerdFromBundle(context.Background(), "m1", l))
+
+	require.NotEmpty(t, exec.Calls)
+	script := exec.Calls[0].Command
+	assert.Contains(t, script, "/var/lib/ko/bundle/cri-dockerd-layer.tar.gz",
+		"script must reference the bundle layer path")
+	assert.Contains(t, script, "install -m 0755 /tmp/ko-cri-dockerd/cri-dockerd /usr/local/bin/cri-dockerd",
+		"cri-dockerd must be installed mode 0755")
+	assert.Contains(t, script, "/etc/systemd/system/cri-dockerd.service",
+		"unit file must land at the systemd convention path")
+	assert.Contains(t, script, "ProtectKernelTunables=true",
+		"unit must apply the same sandbox knobs as ko-registry")
+	assert.Contains(t, script, "systemctl enable --now cri-dockerd.service",
+		"unit must be enabled and started immediately")
+	assert.Contains(t, script, "/run/cri-dockerd/cri-dockerd.sock",
+		"post-start check must look for the CRI socket kubelet will dial")
+}
+
+// TestOfflineRunner_InstallCRIDockerdFromBundle_MissingLayerErrors
+// guards against a silent skip: if the bundle was baked before cri-dockerd
+// landed, docker runtime nodes will never come up — the install must
+// fail loudly rather than silently leaving kubelet to hang.
+func TestOfflineRunner_InstallCRIDockerdFromBundle_MissingLayerErrors(t *testing.T) {
+	exec := NewMockExecutor()
+	defer exec.Close()
+	exec.RunFn = func(_ context.Context, host, command string) Result {
+		return Result{Host: host, Command: command, Stdout: []byte("ok")}
+	}
+	r := &OfflineRunner{Cfg: &config.File{}, Exec: exec}
+	l := &layerPaths{} // no CRIDockerd
+	err := r.InstallCRIDockerdFromBundle(context.Background(), "m1", l)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cri-dockerd layer")
+}
+
+// TestOfflineRunner_HostRuntime_DefaultContainerd pins the default-runtime
+// behaviour: when neither runtime.default nor a per-node override is set,
+// the helper must report containerd so the PrepareHostFromBundle docker
+// branch is skipped.
+func TestOfflineRunner_HostRuntime_DefaultContainerd(t *testing.T) {
+	r := &OfflineRunner{Cfg: &config.File{}}
+	assert.Equal(t, "containerd", r.hostRuntime("any-host"))
+}
+
+// TestOfflineRunner_HostRuntime_OverrideWins pins that an explicit
+// per-node override beats the cluster-wide default — operators rely on
+// this to roll out docker runtime to one host at a time.
+func TestOfflineRunner_HostRuntime_OverrideWins(t *testing.T) {
+	cfg := &config.File{
+		Runtime: config.RuntimeBlock{Default: "containerd"},
+		NodesOverride: []config.NodesOverrideBlock{
+			{Host: "w1", Runtime: "docker"},
+		},
+	}
+	r := &OfflineRunner{Cfg: cfg}
+	assert.Equal(t, "docker", r.hostRuntime("w1"))
+	assert.Equal(t, "containerd", r.hostRuntime("w2"))
+}
+
+// TestOfflineRunner_HostRuntime_ClusterWideDocker pins that
+// runtime.default="docker" applies to every host when no override
+// disagrees.
+func TestOfflineRunner_HostRuntime_ClusterWideDocker(t *testing.T) {
+	cfg := &config.File{Runtime: config.RuntimeBlock{Default: "docker"}}
+	r := &OfflineRunner{Cfg: cfg}
+	assert.Equal(t, "docker", r.hostRuntime("m1"))
+	assert.Equal(t, "docker", r.hostRuntime("w1"))
+}
+
+// TestInstallRuntimeFromBundle_KubeletSnippet asserts the kubelet install
+// line is embedded in the runtime install script when the bundle carries
+// a kubelet layer. Older bundles without a kubelet layer still work —
+// the snippet just renders empty.
+func TestInstallRuntimeFromBundle_KubeletSnippet(t *testing.T) {
+	exec := NewMockExecutor()
+	defer exec.Close()
+	exec.RunFn = func(_ context.Context, host, command string) Result {
+		return Result{Host: host, Command: command, Stdout: []byte("ok")}
+	}
+	r := &OfflineRunner{Cfg: &config.File{}, Exec: exec}
+
+	t.Run("with kubelet layer", func(t *testing.T) {
+		exec.Calls = nil
+		l := &layerPaths{
+			Containerd: "/var/lib/ko/bundle/containerd-layer.tar.gz",
+			Kubeadm:    "/var/lib/ko/bundle/kubeadm-layer.tar.gz",
+			Kubelet:    "/var/lib/ko/bundle/kubelet-layer.tar.gz",
+		}
+		require.NoError(t, r.InstallRuntimeFromBundle(context.Background(), "m1", l))
+		require.NotEmpty(t, exec.Calls)
+		script := exec.Calls[0].Command
+		assert.Contains(t, script, "/var/lib/ko/bundle/kubelet-layer.tar.gz",
+			"kubelet install snippet must reference the layer path")
+		assert.Contains(t, script, "install -m 0755 /tmp/ko-kubelet/kubelet /usr/local/bin/kubelet",
+			"kubelet must be installed to /usr/local/bin mode 0755")
+	})
+
+	t.Run("without kubelet layer", func(t *testing.T) {
+		exec.Calls = nil
+		l := &layerPaths{
+			Containerd: "/var/lib/ko/bundle/containerd-layer.tar.gz",
+			Kubeadm:    "/var/lib/ko/bundle/kubeadm-layer.tar.gz",
+		}
+		require.NoError(t, r.InstallRuntimeFromBundle(context.Background(), "m1", l))
+		require.NotEmpty(t, exec.Calls)
+		script := exec.Calls[0].Command
+		assert.NotContains(t, script, "ko-kubelet",
+			"no kubelet layer → no kubelet install snippet (preserves pre-v0.0.5 behaviour)")
+	})
+}

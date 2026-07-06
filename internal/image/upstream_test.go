@@ -1,26 +1,16 @@
 package image
 
 import (
-	"archive/tar"
-	"compress/gzip"
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// Image-list tests: the static lists are consumed by future pushImages
+// paths in internal/cluster/offline.go.
 
 func TestK8sImagesForVersion_1_32(t *testing.T) {
 	imgs := K8sImagesForVersion("v1.32.0", "amd64")
@@ -58,548 +48,180 @@ func TestCiliumImagesForVersion_VersionInTag(t *testing.T) {
 	assert.NotContains(t, v117, "v1.16.1")
 }
 
-func TestDetectImagePuller_PrefersNerdctlOverDocker(t *testing.T) {
-	p, err := detectImagePuller()
-	if err != nil {
-		// Neither is installed (CI sandbox) — skip; the function only
-		// guarantees behaviour when at least one is on PATH.
-		t.Skipf("no image puller on PATH: %v", err)
-	}
-	// On a dev box both will usually be present; the contract is nerdctl
-	// wins when it's there.
-	if _, err := exec.LookPath("nerdctl"); err == nil {
-		assert.Equal(t, "nerdctl", p.Name())
-	} else {
-		assert.Equal(t, "docker", p.Name())
-	}
+func TestPrometheusImagesForVersion_75_6_1(t *testing.T) {
+	imgs := PrometheusImagesForVersion("75.6.1")
+	assert.Contains(t, imgs, "quay.io/prometheus-operator/prometheus-operator:v0.81.0")
+	assert.Contains(t, imgs, "quay.io/prometheus/prometheus:v3.2.1")
+	assert.Contains(t, imgs, "quay.io/prometheus/alertmanager:v0.28.1")
+	assert.Contains(t, imgs, "quay.io/prometheus/node-exporter:v1.8.2")
+	assert.Contains(t, imgs, "registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.13.0")
+	assert.Contains(t, imgs, "grafana/grafana:11.3.1")
 }
 
-func TestWrapBinaryAsTarGz_PreservesModeAndName(t *testing.T) {
-	// wrapBinaryAsTarGz is invoked at pack time for kubeadm; the resulting
-	// tarball must contain a single ./kubeadm entry with mode 0755.
-	tmp := t.TempDir()
-	bin := tmp + "/kubeadm-src"
-	require.NoError(t, os.WriteFile(bin, []byte("#!/bin/sh\necho ko\n"), 0o644))
+// Vendor-asset tests: UpstreamDownloader is read-only — every method
+// returns the local path under VendorDir for a vendored asset, or an
+// error if the file is missing / below the minimum size.
 
-	tarball := tmp + "/kubeadm.tar.gz"
-	require.NoError(t, wrapBinaryAsTarGz(bin, tarball, "kubeadm"))
+func TestRequireAsset_OK(t *testing.T) {
+	vendor := t.TempDir()
+	target := filepath.Join(vendor, "x", "y.bin")
+	require.NoError(t, os.MkdirAll(filepath.Dir(target), 0o755))
+	require.NoError(t, os.WriteFile(target, make([]byte, 4096), 0o644))
 
-	// Sanity: the tarball is a valid gzip (magic bytes 1f 8b).
-	header := make([]byte, 2)
-	f, err := os.Open(tarball)
+	u := NewUpstream(vendor)
+	got, err := u.requireAsset("x/y.bin", 1024)
 	require.NoError(t, err)
-	defer f.Close()
-	_, err = f.Read(header)
-	require.NoError(t, err)
-	assert.Equal(t, byte(0x1f), header[0])
-	assert.Equal(t, byte(0x8b), header[1])
+	assert.Equal(t, target, got)
 }
 
-// TestDedupDockerArchive_CollapsesDuplicateBlobs builds a synthetic
-// docker-archive tar with two images sharing a layer blob, runs the dedup
-// pass, and verifies the output has the shared blob exactly once.
-func TestDedupDockerArchive_CollapsesDuplicateBlobs(t *testing.T) {
-	tmp := t.TempDir()
-
-	// Build a source tar with two images whose layer lists overlap on
-	// blob "blobs/sha256/shared".
-	src := tmp + "/src.tar"
-	f, err := os.Create(src)
-	require.NoError(t, err)
-	tw := tar.NewWriter(f)
-
-	shared := []byte("shared-payload-im-big")
-	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "blobs/sha256/shared", Mode: 0o644, Size: int64(len(shared))}))
-	_, err = tw.Write(shared)
-	require.NoError(t, err)
-
-	unique1 := []byte("only-image-1-sees-this")
-	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "blobs/sha256/unique1", Mode: 0o644, Size: int64(len(unique1))}))
-	_, err = tw.Write(unique1)
-	require.NoError(t, err)
-
-	unique2 := []byte("only-image-2-sees-this")
-	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "blobs/sha256/unique2", Mode: 0o644, Size: int64(len(unique2))}))
-	_, err = tw.Write(unique2)
-	require.NoError(t, err)
-
-	// Duplicate blob: same path, same content as the first copy.
-	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "blobs/sha256/shared", Mode: 0o644, Size: int64(len(shared))}))
-	_, err = tw.Write(shared)
-	require.NoError(t, err)
-
-	manifest := []byte(`[{"Config":"blobs/sha256/cfg1","RepoTags":["img1"],"Layers":["blobs/sha256/shared","blobs/sha256/unique1"]},{"Config":"blobs/sha256/cfg2","RepoTags":["img2"],"Layers":["blobs/sha256/shared","blobs/sha256/unique2"]}]`)
-	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "manifest.json", Mode: 0o644, Size: int64(len(manifest))}))
-	_, err = tw.Write(manifest)
-	require.NoError(t, err)
-	require.NoError(t, tw.Close())
-	require.NoError(t, f.Close())
-
-	dst := tmp + "/dst.tar"
-	require.NoError(t, dedupDockerArchive(src, dst))
-
-	// Walk the deduped tar and count occurrences of the shared blob.
-	rf, err := os.Open(dst)
-	require.NoError(t, err)
-	defer rf.Close()
-	tr := tar.NewReader(rf)
-
-	sharedCount := 0
-	sawManifest := false
-	for {
-		h, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		require.NoError(t, err)
-		switch h.Name {
-		case "blobs/sha256/shared":
-			sharedCount++
-			body, err := io.ReadAll(tr)
-			require.NoError(t, err)
-			assert.Equal(t, shared, body, "shared blob payload must be preserved")
-		case "manifest.json":
-			sawManifest = true
-			body, err := io.ReadAll(tr)
-			require.NoError(t, err)
-			assert.Contains(t, string(body), "img1")
-			assert.Contains(t, string(body), "img2")
-		default:
-			_, _ = io.Copy(io.Discard, tr)
-		}
-	}
-	assert.Equal(t, 1, sharedCount, "shared blob must appear exactly once in deduped tar")
-	assert.True(t, sawManifest, "manifest.json must be preserved")
-}
-
-// TestDedupDockerArchive_OnRealDockerSave verifies dedup works on a real
-// `docker save` output, not just a synthetic tar. Skips when docker isn't on
-// PATH (e.g. CI sandbox). The point of the test is to surface the case where
-// the host's docker daemon already dedup'd at save time — dedup must be a
-// no-op then, not corrupt the tar.
-func TestDedupDockerArchive_OnRealDockerSave(t *testing.T) {
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skipf("docker not on PATH: %v", err)
-	}
-	tmp := t.TempDir()
-	srcImg := "registry.k8s.io/pause:3.10"
-	if out, err := exec.Command("docker", "pull", srcImg).CombinedOutput(); err != nil {
-		t.Skipf("docker pull %s: %v (%s)", srcImg, err, string(out))
-	}
-	srcTar := tmp + "/pause.tar"
-	if out, err := exec.Command("docker", "save", "-o", srcTar, srcImg).CombinedOutput(); err != nil {
-		t.Fatalf("docker save: %v (%s)", err, string(out))
-	}
-	preStat, err := os.Stat(srcTar)
-	require.NoError(t, err)
-
-	dst := tmp + "/pause.dedup.tar"
-	require.NoError(t, dedupDockerArchive(srcTar, dst))
-
-	// Output must still parse as a docker-archive: manifest.json present,
-	// referenced layers all present as blobs.
-	in, err := os.Open(dst)
-	require.NoError(t, err)
-	defer in.Close()
-	tr := tar.NewReader(in)
-	var manifestData []byte
-	seen := map[string]bool{}
-	for {
-		h, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		require.NoError(t, err)
-		if h.Name == "manifest.json" {
-			manifestData, err = io.ReadAll(tr)
-			require.NoError(t, err)
-			continue
-		}
-		if strings.HasPrefix(h.Name, "blobs/sha256/") {
-			seen[h.Name] = true
-		} else {
-			_, _ = io.Copy(io.Discard, tr)
-		}
-	}
-	require.NotEmpty(t, manifestData, "manifest.json must survive dedup")
-
-	var manifest []map[string]any
-	require.NoError(t, json.Unmarshal(manifestData, &manifest))
-	require.NotEmpty(t, manifest)
-	imgs := manifest[0]
-	layers, _ := imgs["Layers"].([]any)
-	for _, l := range layers {
-		path, _ := l.(string)
-		require.True(t, seen[path], "every layer in manifest must still exist as a blob: %s", path)
-	}
-
-	postStat, err := os.Stat(dst)
-	require.NoError(t, err)
-	t.Logf("real-docker dedup: %d -> %d (ratio %.2fx)",
-		preStat.Size(), postStat.Size(),
-		float64(preStat.Size())/float64(postStat.Size()))
-}
-
-// TestDedupDockerArchive_RefusesUnrecognizedTar guards against accidental
-// corruption: if the input has no manifest.json, dedup must refuse rather
-// than produce an invalid docker-archive.
-func TestDedupDockerArchive_RefusesUnrecognizedTar(t *testing.T) {
-	tmp := t.TempDir()
-	src := tmp + "/not-a-docker-archive.tar"
-	f, err := os.Create(src)
-	require.NoError(t, err)
-	tw := tar.NewWriter(f)
-	body := []byte("hello")
-	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "blobs/sha256/x", Mode: 0o644, Size: int64(len(body))}))
-	_, err = tw.Write(body)
-	require.NoError(t, err)
-	require.NoError(t, tw.Close())
-	require.NoError(t, f.Close())
-
-	err = dedupDockerArchive(src, tmp+"/out.tar")
+func TestRequireAsset_Missing(t *testing.T) {
+	u := NewUpstream(t.TempDir())
+	_, err := u.requireAsset("nope.bin", 1)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no manifest.json")
+	assert.Contains(t, err.Error(), "missing")
+	assert.Contains(t, err.Error(), "ko vendor fetch")
 }
 
-// TestDefaultRegistryVersion_PinGuard asserts the upstream tag ko downloads
-// for the in-cluster registry binary. A future bump must update this constant
-// — the value is loaded by OfflineRunner.startRegistry via the bundle, so an
-// accidental edit could ship a registry that the cluster can't authenticate.
-func TestDefaultRegistryVersion_PinGuard(t *testing.T) {
-	assert.Equal(t, "2.8.3", DefaultRegistryVersion,
-		"bump distribution/distribution pin deliberately, with a registry→cluster compat check")
+func TestRequireAsset_Truncated(t *testing.T) {
+	vendor := t.TempDir()
+	target := filepath.Join(vendor, "tiny.bin")
+	require.NoError(t, os.WriteFile(target, make([]byte, 100), 0o644))
+
+	u := NewUpstream(vendor)
+	_, err := u.requireAsset("tiny.bin", 1000)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "only 100 bytes")
 }
 
-// makeRegistryReleaseTarGz builds a synthetic release tarball in the shape
-// `distribution/distribution` ships: a tar.gz whose root entry is
-// `./registry` (a regular file with mode 0755).
-func makeRegistryReleaseTarGz(t *testing.T, dest string, payload []byte) {
-	t.Helper()
-	f, err := os.Create(dest)
+func TestContainerd_PathLayout(t *testing.T) {
+	vendor := t.TempDir()
+	dst := filepath.Join(vendor, "containerd", "v2.1.0", "linux-amd64.tar.gz")
+	require.NoError(t, os.MkdirAll(filepath.Dir(dst), 0o755))
+	require.NoError(t, os.WriteFile(dst, make([]byte, 11_000_000), 0o644))
+
+	u := NewUpstream(vendor)
+	got, err := u.Containerd("v2.1.0", "amd64")
 	require.NoError(t, err)
-	defer f.Close()
-	gz := gzip.NewWriter(f)
-	defer gz.Close()
-	tw := tar.NewWriter(gz)
-	defer tw.Close()
-	require.NoError(t, tw.WriteHeader(&tar.Header{
-		Name:     "registry",
-		Mode:     0o755,
-		Size:     int64(len(payload)),
-		Typeflag: tar.TypeReg,
-	}))
-	_, err = tw.Write(payload)
-	require.NoError(t, err)
+	assert.Equal(t, dst, got)
 }
 
-// TestExtractSingleBinary_FindsRegistryEntry exercises the unwrap path that
-// RegistryBinary uses: a synthetic release-shaped tar.gz (root entry
-// `./registry`) is fed to extractSingleBinary, which must return a temp
-// file whose contents equal the original payload and whose mode is 0755.
-// The bundle layer shape must match what OfflineRunner.startRegistry
-// expects when it does `tar -xzf … -C /usr/local/bin`.
-func TestExtractSingleBinary_FindsRegistryEntry(t *testing.T) {
-	tmp := t.TempDir()
-	src := tmp + "/registry-release.tar.gz"
-	payload := []byte("#!/bin/sh\necho registry-2.8.3\n")
-	makeRegistryReleaseTarGz(t, src, payload)
-
-	out, err := extractSingleBinary(src, "registry")
+func TestKubeadm_Kubelet_StripOrKeepV(t *testing.T) {
+	vendor := t.TempDir()
+	// kubeadm lives under kubeadm/<k8sVersion>/linux-<arch>.tar.gz — same
+	// convention for kubelet. We expect callers to pass KubeVersion which
+	// already includes the leading v.
+	dst := filepath.Join(vendor, "kubeadm", "v1.32.0", "linux-amd64.tar.gz")
+	require.NoError(t, os.MkdirAll(filepath.Dir(dst), 0o755))
+	require.NoError(t, os.WriteFile(dst, make([]byte, 41_000_000), 0o644))
+	u := NewUpstream(vendor)
+	got, err := u.Kubeadm("v1.32.0", "amd64")
 	require.NoError(t, err)
-	defer os.Remove(out)
-
-	got, err := os.ReadFile(out)
-	require.NoError(t, err)
-	assert.Equal(t, payload, got, "extracted payload must equal the release's ./registry entry")
-
-	st, err := os.Stat(out)
-	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o755), st.Mode().Perm(), "extracted binary must be 0755")
+	assert.Equal(t, dst, got)
 }
 
-// TestRegistryBinary_CachedSkip verifies the cache hit path: when the
-// destination tarball already exists, the downloader must not reach out to
-// the network. We exercise this by populating the cache with a hand-written
-// tarball and asserting the function returns the path with no HTTP calls.
-func TestRegistryBinary_CachedSkip(t *testing.T) {
-	cache := t.TempDir()
-	// Pre-populate the cache at the exact path RegistryBinary writes to.
-	v := "2.8.3"
-	dest := filepath.Join(cache, "registry-bin", fmt.Sprintf("registry-%s-linux-amd64.tar.gz", v))
-	require.NoError(t, os.MkdirAll(filepath.Dir(dest), 0o755))
-	require.NoError(t, os.WriteFile(dest, []byte("pre-cached"), 0o644))
-
-	// HTTP client that would error if called — the cache hit must short-circuit.
-	u := &UpstreamDownloader{
-		CacheDir: cache,
-		HTTP: &http.Client{Transport: mustNotCallTransport{tb: t}},
-	}
-
-	got, err := u.RegistryBinary(context.Background(), v, "amd64")
-	require.NoError(t, err)
-	assert.Equal(t, dest, got)
-}
-
-type mustNotCallTransport struct{ tb testing.TB }
-
-func (m mustNotCallTransport) RoundTrip(*http.Request) (*http.Response, error) {
-	m.tb.Helper()
-	m.tb.Fatal("HTTP must not be called when cache hit is available")
-	return nil, nil
-}
-
-// TestRegistryBinary_StripsVPrefix mirrors the kubeadm convention: callers
-// may pass "v2.8.3" or "2.8.3" interchangeably, the downloader must accept
-// both. We pre-populate the cache so neither call hits the network; the
-// dest path must be identical for both spellings.
 func TestRegistryBinary_StripsVPrefix(t *testing.T) {
-	cache := t.TempDir()
-	u := &UpstreamDownloader{CacheDir: cache, HTTP: &http.Client{Transport: mustNotCallTransport{tb: t}}}
+	vendor := t.TempDir()
+	dst := filepath.Join(vendor, "registry", "v2.8.3", "linux-amd64.tar.gz")
+	require.NoError(t, os.MkdirAll(filepath.Dir(dst), 0o755))
+	require.NoError(t, os.WriteFile(dst, make([]byte, 5_500_000), 0o644))
 
-	// Cache pre-populated so neither call hits the network. The dest path
-	// is the same regardless of v-prefix.
-	dest := filepath.Join(cache, "registry-bin", "registry-2.8.3-linux-amd64.tar.gz")
-	require.NoError(t, os.MkdirAll(filepath.Dir(dest), 0o755))
-	require.NoError(t, os.WriteFile(dest, []byte("x"), 0o644))
-
-	got1, err := u.RegistryBinary(context.Background(), "v2.8.3", "amd64")
+	u := NewUpstream(vendor)
+	got1, err := u.RegistryBinary("v2.8.3", "amd64")
 	require.NoError(t, err)
-	got2, err := u.RegistryBinary(context.Background(), "2.8.3", "amd64")
+	got2, err := u.RegistryBinary("2.8.3", "amd64")
 	require.NoError(t, err)
 	assert.Equal(t, got1, got2, "v-prefix must be optional")
-	assert.Equal(t, dest, got1)
+	assert.Equal(t, dst, got1)
 }
 
-// TestLatestContainerdVersion_CacheHit returns the cached tag without
-// making any HTTP call. Pack builds on the same day should not hammer
-// the GitHub API; the cache file in CacheDir is the source of truth.
-func TestLatestContainerdVersion_CacheHit(t *testing.T) {
-	cache := t.TempDir()
-	u := &UpstreamDownloader{CacheDir: cache, HTTP: &http.Client{Transport: mustNotCallTransport{tb: t}}}
-	require.NoError(t, os.MkdirAll(cache, 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(cache, "containerd-latest.txt"), []byte("v2.1.0\n"), 0o644))
-	got, err := u.LatestContainerdVersion(context.Background())
+func TestDockerStatic_ArchDirectory(t *testing.T) {
+	vendor := t.TempDir()
+	dst := filepath.Join(vendor, "docker", "static", "aarch64", "docker-28.0.0.tgz")
+	require.NoError(t, os.MkdirAll(filepath.Dir(dst), 0o755))
+	require.NoError(t, os.WriteFile(dst, make([]byte, 21_000_000), 0o644))
+
+	u := NewUpstream(vendor)
+	got, err := u.DockerStatic("28.0.0", "arm64")
 	require.NoError(t, err)
-	assert.Equal(t, "v2.1.0", got)
+	assert.Equal(t, dst, got, "arm64 must resolve to aarch64/")
 }
 
-// TestLatestDockerVersion_CacheHit mirrors the containerd one.
-func TestLatestDockerVersion_CacheHit(t *testing.T) {
-	cache := t.TempDir()
-	u := &UpstreamDownloader{CacheDir: cache, HTTP: &http.Client{Transport: mustNotCallTransport{tb: t}}}
-	require.NoError(t, os.WriteFile(filepath.Join(cache, "docker-latest.txt"), []byte("v28.0.0"), 0o644))
-	got, err := u.LatestDockerVersion(context.Background())
+func TestDockerDeb_GlobHitsFile(t *testing.T) {
+	vendor := t.TempDir()
+	dir := filepath.Join(vendor, "docker", "deb", "amd64")
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	dst := filepath.Join(dir, "docker-ce_28.0.0-1_amd64.deb")
+	require.NoError(t, os.WriteFile(dst, make([]byte, 2_000_000), 0o644))
+
+	u := NewUpstream(vendor)
+	got, err := u.DockerDeb("amd64")
 	require.NoError(t, err)
-	assert.Equal(t, "v28.0.0", got)
+	assert.Equal(t, dst, got)
 }
 
-// TestLatestContainerdVersion_HitsGitHub feeds a fake GitHub API response
-// and asserts the tag_name is parsed + cached. Verifies the upstream tag
-// is fetched from /repos/containerd/containerd/releases/latest.
-func TestLatestContainerdVersion_HitsGitHub(t *testing.T) {
-	cache := t.TempDir()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "/repos/containerd/containerd/releases/latest", r.URL.Path)
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"tag_name": "v2.0.5"})
-	}))
-	defer srv.Close()
-	u := &UpstreamDownloader{
-		CacheDir: cache,
-		HTTP:     &http.Client{Timeout: 10 * time.Second},
-	}
-	// Override the GitHub URL by writing our own fetch path: we exercise
-	// the same code path by handing httptest.NewServer's URL through
-	// LatestContainerdVersion via a small test wrapper. The simplest way
-	// is to call the underlying helper with a swapped URL prefix; since
-	// the URL is hardcoded in latestGitHubTag, we instead assert the
-	// happy path end-to-end by waiting for the cached file to be written.
-	//
-	// This test serves as a documentation anchor: "LatestContainerdVersion
-	// writes the tag to <cache>/containerd-latest.txt". The end-to-end
-	// GitHub fetch is covered by manual integration; we don't want to
-	// dial api.github.com in a unit test.
-	_ = srv
-	got, err := u.LatestContainerdVersion(context.Background())
-	// Either we got a real tag from GitHub (network allowed), or an
-	// error from no-network. Both outcomes are acceptable for this
-	// documentation anchor; what matters is that no panic.
-	if err == nil {
-		assert.NotEmpty(t, got)
-		cached, _ := os.ReadFile(filepath.Join(cache, "containerd-latest.txt"))
-		assert.NotEmpty(t, cached)
-	}
-}
-
-// TestLatestDockerVersion_HitsGitHub mirrors containerd; the URL is
-// /repos/moby/moby/releases/latest.
-func TestLatestDockerVersion_HitsGitHub(t *testing.T) {
-	cache := t.TempDir()
-	u := &UpstreamDownloader{
-		CacheDir: cache,
-		HTTP:     &http.Client{Timeout: 10 * time.Second},
-	}
-	got, err := u.LatestDockerVersion(context.Background())
-	if err == nil {
-		assert.NotEmpty(t, got)
-	}
-}
-
-// TestRegistryBinary_RejectsMissingEntry feeds the downloader a tarball that
-// doesn't contain a `registry` entry — it must surface a clear error rather
-// than silently produce an empty tarball.
-func TestRegistryBinary_RejectsMissingEntry(t *testing.T) {
-	tmp := t.TempDir()
-	bad := tmp + "/wrong-name.tar.gz"
-	f, err := os.Create(bad)
-	require.NoError(t, err)
-	gz := gzip.NewWriter(f)
-	tw := tar.NewWriter(gz)
-	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "not-registry", Mode: 0o644, Size: 4, Typeflag: tar.TypeReg}))
-	_, _ = tw.Write([]byte("nope"))
-	require.NoError(t, tw.Close())
-	require.NoError(t, gz.Close())
-	require.NoError(t, f.Close())
-
-	_, err = extractSingleBinary(bad, "registry")
+func TestDockerDeb_GlobMissIsError(t *testing.T) {
+	u := NewUpstream(t.TempDir())
+	_, err := u.DockerDeb("amd64")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), `no "registry" entry`)
+	assert.Contains(t, err.Error(), "docker-ce_*.deb")
 }
 
-// makeFakeNerdctl writes a shell script at <dir>/nerdctl that emulates the
-// subset of `nerdctl pull / save / rmi` ko's image puller uses. Each
-// invocation is appended to $KO_FAKE_LOG (one line, space-joined args) so
-// tests can assert call order and arguments.
-//
-// `save -o <dest> <imgs>` writes a minimal but valid docker-archive to
-// <dest> (manifest.json + a single blobs/sha256/ layer) so the production
-// dedupDockerArchive pass has something to chew on without erroring.
-//
-// `rmi <img>` exits non-zero if $KO_FAKE_RMI_FAIL_<sha256(img)>=1 is set,
-// allowing per-image failure injection.
-func makeFakeNerdctl(t *testing.T, dir string) string {
-	t.Helper()
-	script := `#!/bin/sh
-LOG="${KO_FAKE_LOG:-/dev/null}"
-echo "$*" >> "$LOG"
+func TestDockerRPM_ArchMapping(t *testing.T) {
+	vendor := t.TempDir()
+	dir := filepath.Join(vendor, "docker", "rpm", "aarch64")
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	dst := filepath.Join(dir, "docker-ce-28.0.0-1.aarch64.rpm")
+	require.NoError(t, os.WriteFile(dst, make([]byte, 2_000_000), 0o644))
 
-case "$1" in
-  pull|save) exit 0 ;;
-  rmi)
-    shift
-    for img in "$@"; do
-      key="KO_FAKE_RMI_FAIL_$(printf '%s' "$img" | shasum -a 256 | cut -d' ' -f1)"
-      eval "val=\$$key"
-      if [ "$val" = "1" ]; then
-        echo "fake-nerdctl: refusing to rmi $img" >&2
-        exit 1
-      fi
-    done
-    exit 0
-    ;;
-esac
-exit 0
-`
-	// For save we need a tiny inline valid tar; write it once at fake-time
-	// by composing a heredoc through tar(1) is fiddly cross-platform. The
-	// tests that exercise save can pre-write a valid docker-archive at the
-	// path `save` would produce — see TestK8sImagesTar_CallsRemoveAfterSave
-	// for the no-pre-write case (we just exercise Remove directly).
-	bin := filepath.Join(dir, "nerdctl")
-	require.NoError(t, os.WriteFile(bin, []byte(script), 0o755))
-	return bin
+	u := NewUpstream(vendor)
+	got, err := u.DockerRPM("arm64")
+	require.NoError(t, err)
+	assert.Equal(t, dst, got, "arm64 must resolve to aarch64/ for RPM layout")
 }
 
-// TestCliPuller_Remove_InvokesRmiWithImages asserts the happy path:
-// Remove runs one `<bin> rmi <img>` per image, in order. Per-image exec
-// is intentional: if a single rmi fails (image referenced by a stopped
-// container, layered image, etc.), the rest of the cleanup pass must
-// still attempt every other image. That's the best-effort contract pack
-// relies on to free the k8s/cilium/registry:2 set.
-func TestCliPuller_Remove_InvokesRmiWithImages(t *testing.T) {
-	tmp := t.TempDir()
-	bin := makeFakeNerdctl(t, tmp)
-	log := filepath.Join(tmp, "nerdctl.log")
-	t.Setenv("KO_FAKE_LOG", log)
+func TestK8sImagesTar_PathLayout(t *testing.T) {
+	vendor := t.TempDir()
+	dst := filepath.Join(vendor, "images", "k8s-v1.32.0-amd64.tar")
+	require.NoError(t, os.MkdirAll(filepath.Dir(dst), 0o755))
+	require.NoError(t, os.WriteFile(dst, make([]byte, 110_000_000), 0o644))
 
-	p := &cliPuller{bin: bin}
-	imgs := []string{
-		"registry.k8s.io/kube-apiserver:v1.32.0",
-		"registry.k8s.io/etcd:3.5.16-0",
-	}
-	err := p.Remove(context.Background(), imgs)
+	u := NewUpstream(vendor)
+	got, err := u.K8sImagesTar("v1.32.0", "amd64")
 	require.NoError(t, err)
-
-	body, err := os.ReadFile(log)
-	require.NoError(t, err)
-	// One rmi invocation per image, source order preserved.
-	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
-	require.Len(t, lines, len(imgs), "expected one rmi invocation per image, got %d lines", len(lines))
-	for i, img := range imgs {
-		assert.Equal(t, "rmi "+img, lines[i],
-			"line %d must be `rmi <img>` in source order", i)
-	}
+	assert.Equal(t, dst, got)
 }
 
-// TestCliPuller_Remove_ContinuesOnPerImageFailure pins the best-effort
-// contract: a single rmi failure must not abort the cleanup pass. Pack
-// must still try every image it pulled, and the joined error must name
-// the offenders so the operator can chase them manually.
-func TestCliPuller_Remove_ContinuesOnPerImageFailure(t *testing.T) {
-	tmp := t.TempDir()
-	bin := makeFakeNerdctl(t, tmp)
-	log := filepath.Join(tmp, "nerdctl.log")
-	t.Setenv("KO_FAKE_LOG", log)
+func TestCiliumImagesTar_StripsVPrefix(t *testing.T) {
+	vendor := t.TempDir()
+	dst := filepath.Join(vendor, "images", "cilium-v1.16.1.tar")
+	require.NoError(t, os.MkdirAll(filepath.Dir(dst), 0o755))
+	require.NoError(t, os.WriteFile(dst, make([]byte, 110_000_000), 0o644))
 
-	// Refuse to rmi kube-apiserver. The fake checks
-	// $KO_FAKE_RMI_FAIL_<sha256(img)>=1; the production Remove calls
-	// `rmi` once with all images, so the first failure already covers
-	// the "best-effort" path — the script returns non-zero before
-	// processing later args. The contract: Remove must still return a
-	// clean error (not panic) and not partially-revert state.
-	apiserver := "registry.k8s.io/kube-apiserver:v1.32.0"
-	key := "KO_FAKE_RMI_FAIL_" + singleSHA256(t, apiserver)
-	t.Setenv(key, "1")
-
-	p := &cliPuller{bin: bin}
-	err := p.Remove(context.Background(), []string{apiserver})
-	require.Error(t, err, "Remove must surface the rmi failure as a joined error")
-	assert.Contains(t, err.Error(), apiserver, "joined error must name the failed image")
-
-	// The invocation was attempted — the operator at least knows we tried.
-	body, err := os.ReadFile(log)
+	u := NewUpstream(vendor)
+	got1, err := u.CiliumImagesTar("v1.16.1")
 	require.NoError(t, err)
-	assert.Contains(t, string(body), "rmi", "rmi subcommand must have been invoked")
+	got2, err := u.CiliumImagesTar("1.16.1")
+	require.NoError(t, err)
+	assert.Equal(t, got1, got2)
+	assert.Equal(t, dst, got1)
 }
 
-// TestCliPuller_Remove_EmptyListNoop asserts Remove on an empty image list
-// is a no-op: no exec, no error. K8sImagesTar / CiliumImagesTar have
-// static image lists so this is more of a defensive contract than a hot
-// path, but it's the kind of thing a future refactor could break.
-func TestCliPuller_Remove_EmptyListNoop(t *testing.T) {
-	tmp := t.TempDir()
-	bin := makeFakeNerdctl(t, tmp)
-	log := filepath.Join(tmp, "nerdctl.log")
-	t.Setenv("KO_FAKE_LOG", log)
-	// Pre-touch so os.ReadFile doesn't fail when the script never runs.
-	require.NoError(t, os.WriteFile(log, nil, 0o644))
+func TestHelmCharts_PathLayout(t *testing.T) {
+	vendor := t.TempDir()
 
-	p := &cliPuller{bin: bin}
-	err := p.Remove(context.Background(), nil)
-	require.NoError(t, err)
-	err = p.Remove(context.Background(), []string{})
-	require.NoError(t, err)
+	c := filepath.Join(vendor, "charts", "cilium-1.16.1.tgz")
+	require.NoError(t, os.MkdirAll(filepath.Dir(c), 0o755))
+	require.NoError(t, os.WriteFile(c, make([]byte, 8000), 0o644))
 
-	body, err := os.ReadFile(log)
-	require.NoError(t, err)
-	assert.Empty(t, strings.TrimSpace(string(body)), "no exec must happen on an empty image list")
-}
+	p := filepath.Join(vendor, "charts", "kube-prometheus-stack-75.6.1.tgz")
+	require.NoError(t, os.WriteFile(p, make([]byte, 8000), 0o644))
 
-// singleSHA256 is a tiny helper used by the rmi-failure test to compute
-// the same digest the fake shell script derives (shasum -a 256).
-// Cross-platform: we use Go's crypto/sha256 to avoid spawning shasum.
-func singleSHA256(t *testing.T, s string) string {
-	t.Helper()
-	h := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(h[:])
+	u := NewUpstream(vendor)
+	gotC, err := u.CiliumChartTGZ("1.16.1")
+	require.NoError(t, err)
+	assert.Equal(t, c, gotC)
+
+	gotP, err := u.PrometheusChartTGZ("75.6.1")
+	require.NoError(t, err)
+	assert.Equal(t, p, gotP)
 }

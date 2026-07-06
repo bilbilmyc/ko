@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/ko-build/ko/internal/version"
 )
 
 // TestDefaultBundleName covers the contract that the default `--version`
@@ -55,7 +57,7 @@ func TestDefaultBundleName(t *testing.T) {
 // the resulting tarball name follows the convention documented in RUNBOOK §1.1.
 func TestDefaultBundleName_RendersForAllArch(t *testing.T) {
 	fixed := time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC)
-	prefix := defaultBundleName(defaultK8sVersion, defaultCiliumVersion, fixed)
+	prefix := defaultBundleName(version.KubeVersion, version.CiliumVersion, fixed)
 
 	// These suffixes mirror what builder.go and multi.go append to opts.Version.
 	const (

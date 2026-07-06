@@ -68,6 +68,8 @@ type offlineLayout struct {
 type layerPaths struct {
 	Containerd     string
 	Kubeadm        string
+	Kubelet        string // v0.0.5+ — static kubelet binary, offline install
+	CRIDockerd     string // v0.0.5+ — optional; required when any node uses docker runtime
 	K8sImages      string
 	CiliumImages   string
 	RegistryImage  string // optional (legacy: docker-archive, no longer used at runtime)
@@ -156,12 +158,25 @@ func (r *OfflineRunner) Run(ctx context.Context) error {
 		return err
 	}
 
-	// 9. kubelet drop-in. In an airgap, kubelet's default
+	// 9a. cri-dockerd install for every node whose runtime is docker.
+	// v0.0.5+ — k8s ≥ 1.24 dropped dockershim, so docker runtime nodes
+	// need the cri-dockerd CRI shim before kubelet starts. Containerd
+	// nodes skip this step entirely.
+	all := append(append([]string{}, o.masters...), o.workers...)
+	for _, h := range all {
+		if r.hostRuntime(h) == "docker" {
+			if err := r.InstallCRIDockerdFromBundle(ctx, h, layers); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 9b. kubelet drop-in. In an airgap, kubelet's default
 	// --image-pull-progress-deadline=1m aborts large-image pulls (cilium
 	// alone is ~200M); the drop-in extends it to 30m and adds production
 	// eviction thresholds. Applied to every master+worker so `ko node
 	// add` against an already-initialised cluster doesn't have to redo it.
-	if err := writeKubeletDropInAll(ctx, r.Exec, append(append([]string{}, o.masters...), o.workers...)); err != nil {
+	if err := writeKubeletDropInAll(ctx, r.Exec, all); err != nil {
 		return err
 	}
 
@@ -260,6 +275,14 @@ func (r *OfflineRunner) classifyLayer(mediaType, blobPath string, paths *layerPa
 		if paths.Kubeadm == "" {
 			paths.Kubeadm = blobPath
 		}
+	case image.MediaTypeKoKubeletBinary:
+		if paths.Kubelet == "" {
+			paths.Kubelet = blobPath
+		}
+	case image.MediaTypeKoCRIDockerdBinary:
+		if paths.CRIDockerd == "" {
+			paths.CRIDockerd = blobPath
+		}
 	case image.MediaTypeKoK8sImagesTar:
 		if paths.K8sImages == "" {
 			paths.K8sImages = blobPath
@@ -342,17 +365,117 @@ mkdir -p /tmp/ko-kubeadm
 tar -xzf %[2]s -C /tmp/ko-kubeadm
 install -m 0755 /tmp/ko-kubeadm/kubeadm /usr/local/bin/kubeadm
 rm -rf /tmp/ko-kubeadm
-
+%[3]s
 systemctl daemon-reload
 systemctl enable --now containerd
 
 # Dirs the kubelet + static-pod manifests will live in. Filled in by
 # kubeadm init shortly after.
 mkdir -p /var/lib/kubelet /etc/kubernetes/manifests
-`, l.Containerd, l.Kubeadm)
+`, l.Containerd, l.Kubeadm, installKubeletSnippet(l.Kubelet))
 	res := r.Exec.Run(ctx, host, script)
 	if res.Failed() {
 		return fmt.Errorf("install runtime on %s: %w (stderr=%s)", host, res.Err, string(res.Stderr))
+	}
+	return nil
+}
+
+// installKubeletSnippet renders the kubelet install snippet to embed in
+// InstallRuntimeFromBundle's script. Empty string when the bundle has no
+// kubelet layer (older packs without one — the install then becomes a
+// no-op so existing behaviour is preserved).
+func installKubeletSnippet(kubeletLayer string) string {
+	if kubeletLayer == "" {
+		return ""
+	}
+	return fmt.Sprintf(`# kubelet (static binary — apt/dnf can't reach k8s.io in airgap).
+mkdir -p /tmp/ko-kubelet
+tar -xzf %[1]s -C /tmp/ko-kubelet
+install -m 0755 /tmp/ko-kubelet/kubelet /usr/local/bin/kubelet
+rm -rf /tmp/ko-kubelet
+`, kubeletLayer)
+}
+
+// InstallCRIDockerdFromBundle extracts the cri-dockerd binary from the
+// bundle and installs + starts it as a hardened systemd service. Only
+// invoked when cfg.Runtime.Default == "docker" (or a per-node override
+// pins docker) — k8s ≥ 1.24 dropped the in-tree dockershim, so kubelet
+// needs cri-dockerd as its CRI endpoint for the docker runtime path.
+//
+// The unit file mirrors the upstream Mirantis packaging but with the
+// same sandbox knobs we use for ko-registry: NoNewPrivileges,
+// ProtectKernelTunables, ProtectControlGroups, PrivateTmp, etc. The
+// socket binds on /run/cri-dockerd/cri-dockerd.sock (matches
+// criDockerdEndpoint in kubelet.go).
+func (r *OfflineRunner) InstallCRIDockerdFromBundle(ctx context.Context, host string, l *layerPaths) error {
+	if l.CRIDockerd == "" {
+		return fmt.Errorf("bundle missing cri-dockerd layer (re-bake with v0.0.5+; this runtime requires k8s ≥ 1.24 + cri-dockerd)")
+	}
+	script := fmt.Sprintf(`set -euo pipefail
+mkdir -p /tmp/ko-cri-dockerd
+tar -xzf %[1]s -C /tmp/ko-cri-dockerd
+install -m 0755 /tmp/ko-cri-dockerd/cri-dockerd /usr/local/bin/cri-dockerd
+rm -rf /tmp/ko-cri-dockerd
+
+# Hardened systemd unit. cri-dockerd is itself a static Go binary; we
+# only need a thin unit that wraps it with the right sandbox knobs and
+# brings it up before kubelet starts (kubelet.service After= ordering).
+cat > /etc/systemd/system/cri-dockerd.service <<'UNIT_EOF'
+[Unit]
+Description=cri-dockerd (CRI shim for Docker, k8s ≥ 1.24)
+Documentation=https://github.com/Mirantis/cri-dockerd
+After=network-online.target containerd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cri-dockerd \
+  --container-runtime-endpoint=unix:///var/run/docker.sock \
+  --cri-socket=unix:///run/cri-dockerd/cri-dockerd.sock \
+  --network-plugin=
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+# Security hardening (matches the ko-registry unit shape).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+# cri-dockerd needs to manage the docker daemon; keep the docker socket
+# rw so it can hot-connect when dockerd restarts.
+ReadWritePaths=/run/cri-dockerd /var/run /var/lib/docker
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+
+systemctl daemon-reload
+systemctl enable --now cri-dockerd.service
+
+# Sanity check — the socket must exist within ~10s, otherwise kubelet
+# will hang at startup and the cluster will fail to come up.
+for i in $(seq 1 10); do
+  if [ -S /run/cri-dockerd/cri-dockerd.sock ]; then
+    echo "cri-dockerd up after ${i}s"
+    exit 0
+  fi
+  sleep 1
+done
+echo "cri-dockerd socket did not appear within 10s" >&2
+journalctl -u cri-dockerd.service --no-pager -n 50 >&2 || true
+exit 1
+`, l.CRIDockerd)
+	res := r.Exec.Run(ctx, host, script)
+	if res.Failed() {
+		return fmt.Errorf("install cri-dockerd on %s: %w (stderr=%s)", host, res.Err, string(res.Stderr))
 	}
 	return nil
 }
@@ -619,6 +742,10 @@ grep -qF '%[1]s' /etc/hosts || echo '%[1]s' >> /etc/hosts
 // `ko.local → master1IP` in /etc/hosts and the kubelet drop-in so it can
 // pull from the in-cluster registry.
 //
+// When the per-host runtime is docker, also installs cri-dockerd before
+// the kubelet drop-in — kubelet's drop-in then points at the cri-dockerd
+// CRI socket (k8s ≥ 1.24 dropped the in-tree dockershim).
+//
 // `master1IP` is the IP every node should reach `ko.local` at — the first
 // master's IP for non-HA, or the VIP for HA setups. It must already be
 // resolvable from the new host (which is true once /etc/hosts is
@@ -637,10 +764,35 @@ func (r *OfflineRunner) PrepareHostFromBundle(ctx context.Context, host, master1
 	if err := r.WriteHostsEntry(ctx, host, master1IP); err != nil {
 		return err
 	}
+	// v0.0.5+: docker runtime needs cri-dockerd up before kubelet starts,
+	// otherwise the kubelet drop-in's --container-runtime-endpoint points
+	// at a socket that doesn't exist yet. Install it here only when the
+	// per-host config asks for docker; containerd nodes skip this step.
+	if r.hostRuntime(host) == "docker" {
+		if err := r.InstallCRIDockerdFromBundle(ctx, host, layers); err != nil {
+			return err
+		}
+	}
 	if err := WriteKubeletDropIn(ctx, r.Exec, host); err != nil {
 		return err
 	}
 	return nil
+}
+
+// hostRuntime resolves the per-host runtime: an explicit
+// nodes_override.runtime wins, otherwise the cluster-wide
+// runtime.default (empty string when neither is set — caller treats that
+// as "containerd" since that's the default in pkg/config defaults).
+func (r *OfflineRunner) hostRuntime(host string) string {
+	if r.Cfg != nil {
+		if ov := r.Cfg.LookupNodeOverride(host); ov != nil && ov.Runtime != "" {
+			return ov.Runtime
+		}
+		if r.Cfg.Runtime.Default != "" {
+			return r.Cfg.Runtime.Default
+		}
+	}
+	return "containerd"
 }
 
 // writeHosts appends `<master-1-IP> ko.local` to /etc/hosts on every node.

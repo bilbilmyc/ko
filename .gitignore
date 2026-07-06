@@ -7,11 +7,25 @@ dist/
 *.out
 coverage.out
 coverage.html
-vendor/_cache/
 
-# Vendored binaries (user-provided, see SPEC §4)
-# Tracked via git for amd64/arm64 when user provides them; _cache is ignored.
-vendor/_cache/
+# Vendored assets (v0.0.5+ mega-bundle — every binary/image/chart ko
+# pack needs, populated by `ko vendor fetch` from scripts/fetch-vendor.sh.
+# The vendored assets themselves are NOT committed; only
+# vendor-versions.env (version pins) and the fetch script live in git.
+# See RUNBOOK §1.2 and SPEC §4.
+#
+# Layout:
+#   third_party/containerd/<ver>/{linux-amd64,linux-arm64}.tar.gz
+#   third_party/kubeadm/<ver>/{linux-amd64,linux-arm64}.tar.gz
+#   third_party/kubelet/<ver>/{linux-amd64,linux-arm64}.tar.gz
+#   third_party/cri-dockerd/<ver>/{linux-amd64,linux-arm64}.tar.gz
+#   third_party/registry/<ver>/{linux-amd64,linux-arm64}.tar.gz
+#   third_party/docker/{deb,rpm}/{amd64,arm64,x86_64,aarch64}/
+#   third_party/images/{k8s,cilium,prometheus}-*.tar
+#   third_party/charts/{cilium,kube-prometheus-stack}-*.tgz
+third_party/
+!vendor-versions.env
+!scripts/fetch-vendor.sh
 
 # Frontend
 web/node_modules/
