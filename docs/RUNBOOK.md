@@ -25,7 +25,9 @@ ko doctor --config cluster.hcl
 
 S17 之后，离线部署才真的"全离线"：bundle 里同时烤了 `containerd` / `kubeadm` 二进制 / `k8s 控制面` 镜像（apiserver / controller-manager / scheduler / proxy / coredns / pause / etcd）/ `cilium` 全部镜像 / `registry:2` 仓库镜像本身 / `cilium` helm chart。`ko init --offline` 会在 master-1 拉起一个 in-cluster Docker distribution registry，把这些镜像 re-tag 进去，然后通过 containerd mirror config 自动把所有 upstream 拉取重写到本地。
 
-### 1.1 bundle 里到底有什么
+### 1.1 bundle 里到底有什么（v0.0.5 mega-bundle）
+
+v0.0.5 把 bundle 从"几层关键资产"扩成"全自包含的 K8s 安装包"。**`ko init --offline --bundle <bundle.tar.gz>` 跑完的整个流程不再访问任何公网**——所有 binary、所有 image、helm chart 全在 bundle 里。`ko vendor fetch` + `ko pack build` 是仅有的两个能上网的步骤（都在 operator 本机）。
 
 ```
 dist/bundle-k8s1.32.0-cilium1.16.1-20260705-multi.oci.tar.gz
@@ -33,40 +35,64 @@ dist/bundle-k8s1.32.0-cilium1.16.1-20260705-multi.oci.tar.gz
 ├─ oci-layout
 └─ blobs/sha256/
    ├─ <amd64 manifest>
-   │   ├─ containerd-<latest>-linux-amd64.tar.gz      ← pack 时 fetch latest stable（v0.0.5+）
-   │   ├─ kubeadm-v1.32.0-linux-amd64.tar.gz          ← kubeadm 静态二进制
-   │   ├─ k8s-1.32.0-amd64.tar                       ← kube-apiserver/controller-manager/
+   │   ├─ containerd-v2.1.0-linux-amd64.tar.gz       ← 静态二进制（pin 在 internal/version）
+   │   ├─ kubeadm-v1.32.0-linux-amd64.tar.gz         ← kubeadm 静态二进制
+   │   ├─ kubelet-v1.32.0-linux-amd64.tar.gz         ← kubelet 静态二进制（v0.0.5+）
+   │   ├─ cri-dockerd-v0.3.14-linux-amd64.tar.gz     ← CRI shim（v0.0.5+，docker runtime 时用）
+   │   ├─ docker-28.0.0.tgz                          ← dockerd + docker + containerd（v0.0.5+，static 路径）
+   │   ├─ k8s-v1.32.0-amd64.tar                      ← kube-apiserver/controller-manager/
    │   │                                              scheduler/proxy/coredns/pause/etcd
-   │   ├─ registry-2-linux-amd64.tar                 ← registry:2 镜像（备选，不再主用）
-   │   ├─ registry-2.8.3-linux-amd64.tar.gz          ← static Go 二进制（主用）
-   │   ├─ cilium-1.16.1-images.tar                   ← cilium/operator/hubble/...
-   │   └─ cilium-1.16.1.tgz                          ← helm chart
+   │   ├─ registry-v2.8.3-linux-amd64.tar.gz          ← static Go 二进制（distribution/distribution）
+   │   ├─ cilium-v1.16.1-images.tar                  ← cilium/operator/hubble/...
+   │   ├─ cilium-1.16.1.tgz                          ← helm chart
+   │   ├─ prometheus-stack-v75.6.1-images.tar        ← prometheus operator + grafana + …（可选）
+   │   └─ kube-prometheus-stack-75.6.1.tgz           ← helm chart（可选）
    └─ <arm64 manifest>                                （chart/k8s-images/registry 跨架构去重）
 ```
 
 每层都是独立 mediaType（`vnd.ko.layer.*`），operator 用 `ko pack inspect <bundle>` 看。
 
-**v0.0.5+ containerd / docker 版本追踪**：
+**asset 版本源**：`internal/version/versions.go` 集中 pin 所有版本，`vendor-versions.env` 是 `scripts/fetch-vendor.sh` 的 source of truth。`TestVendorVersionsSync`（`internal/version/versions_test.go`）强制两边对齐——漂移就 fail build。改版本：同时改两处，重新 `ko vendor fetch` + `ko pack build`。
 
-- `ko pack build` 不再写死 containerd 版本。默认调 GitHub API `repos/containerd/containerd/releases/latest` 拿 tag（如 `v2.0.5` / `v2.1.0`），24h cache 到 `~/.ko/cache/containerd-latest.txt`。GitHub 不可达退到 `v2.1.0` 而不是 fail
-- docker CE 不在 GitHub release 走（apt 渠道），改为 `apt install docker-ce`（channel=stable 默认装最新），不再写死 `27.5.1`。HCL `docker.version` 仍可显式 pin
-- bundle 一旦烤完，containerd 版本冻结（registry 二进制、kubeadm 静态二进制同理）。新版本要重烤
+**`third_party/` 是 operator-local state**：仓库本身 git-ignored `third_party/`；commit 的只有 `internal/version/versions.go` + `vendor-versions.env` + `scripts/fetch-vendor.sh`。这样 repo 体积不爆炸，operator 按需下载。
 
-### 1.2 在能上网的机器上打包
+**docker offline install 路径（v0.0.5+）**：
+
+- **.deb / .rpm**（operator 手动下好后放 `third_party/docker/deb/amd64/` 或 `third_party/docker/rpm/x86_64/`）：走 `dpkg -i --force-depends` / `dnf -y localinstall --nogpgcheck`
+- **static tgz**：当 operator 没下包时 fallback，`tar -xzf` 到 `/usr/local/bin/`（含 dockerd + docker + containerd）+ 写最小 `docker.service`
+- **零 `download.docker.com`**：`internal/docker/install.go::InstallOffline` 任何分支都不能 curl/wget https（`TestInstallOfflineBranch_NeverHitsDownloadDockerCom` 守住）
+
+**docker runtime 在 k8s ≥ 1.24 的注意**：
+
+- kubelet 不再走 dockershim，必须通过 CRI 端点。docker runtime 时 kubelet drop-in 追加 `--container-runtime-endpoint=unix:///run/cri-dockerd/cri-dockerd.sock`
+- cri-dockerd 来自 bundle 里 `cri-dockerd-v0.3.14` 层，install 时写到 `/usr/local/bin/cri-dockerd` + hardened systemd unit
+- **不要把 kubelet 配到 `/var/run/docker.sock`**（docker engine socket，不是 CRI endpoint）— `NodeLifecycle.criSocket` 已经修过，docker 走 cri-dockerd
+
+### 1.2 在能上网的机器上打包（v0.0.5 mega-bundle）
+
+打包分两步：先 `ko vendor fetch` 把所有 asset 烤进 `third_party/`（**唯一会访问公网**的步骤），再 `ko pack build` 把 `third_party/` 烤成单一 tar.gz。
 
 ```bash
+# 1. 拉所有 binary + image + chart 到 third_party/（v0.0.5+ 新增）
+ko vendor fetch
+# 等价于手动跑 ./scripts/fetch-vendor.sh
+
+# 2. 烤 bundle（零网络，全从 third_party/ 读）
 ko pack build --arch all --output ./dist --version bundle-k8s1.32.0-cilium1.16.1-20260705
-# 产物：dist/bundle-k8s1.32.0-cilium1.16.1-20260705-multi.oci.tar.gz  (amd64 bundle ~826M；含 containerd + kubeadm + k8s 控制面镜像 + registry 静态二进制 + cilium 全部镜像)
-# 注：containerd 层文件名会反映 pack 当天的 latest tag（如 containerd-2.0.5-linux-amd64.tar.gz）
-```
+# 产物：dist/bundle-k8s1.32.0-cilium1.16.1-20260705-multi.oci.tar.gz
+# 单架构：dist/bundle-k8s1.32.0-cilium1.16.1-20260705-amd64.oci.tar.gz
 
-如果只想给一种架构烤：
-
-```bash
+# 只想烤一种架构：
 ko pack build --arch amd64 --output ./dist --version bundle-k8s1.32.0-cilium1.16.1-20260705
+
+# 想看 third_party/ 里到底有什么：
+ko vendor paths
+
+# 想清空重烤：
+ko vendor clean && ko vendor fetch
 ```
 
-烤好的 bundle 推到**公司内部存储**（HTTP / NFS / MinIO 等 — 待选型，见 PLAN §8.6），交付时与 ko 二进制一起给到目标机器。详细流程见 §2.8 交付物。
+烤好的 bundle 推到**公司内部存储**（HTTP / NFS / MinIO 等 — 待选型，见 PLAN §8.6），交付时与 ko 二进制一起给到目标机器。
 
 **v0.0.5+ pack 完本机镜像自动清理**：bundle 烤完后 `ImagePuller.Remove` 会把本机 docker/nerdctl 镜像存储里临时拉入的 k8s / cilium / `registry:2` 镜像 `rmi` 掉（best-effort，单张失败 `logger.Warn` 后继续），单次 pack 大约释放 5-10 GB。**`~/.ko/cache/<sha>.tar` 不动**（那是 bundle 层的真实输入，下次 pack 复用）。
 
@@ -326,11 +352,12 @@ ko node add 10.0.0.24 --role worker --config cluster.hcl
 
 ko 会：
 1. 把 bundle 推到新机器（仅离线模式）
-2. 在新机器装 runtime（containerd / docker）
+2. 在新机器装 runtime（containerd / docker）— docker 时走 `InstallOffline`（deb/rpm/static tgz 三选一，零网络）
 3. 在新机器装 kubeadm/kubelet（离线从 bundle 解，在线从 apt/yum 源）
-4. `kubeadm join --worker` 到集群
-5. kubelet 启动时所有 image 拉取走 containerd mirror → `ko.local:5000`
-6. 等 Node Ready 后退出
+4. **docker runtime 节点额外装 cri-dockerd**（v0.0.5+，必须在 kubelet 起来之前）
+5. `kubeadm join --worker` 到集群；kubelet drop-in 自动加 `--container-runtime-endpoint` 指向正确的 CRI socket（containerd → `/run/containerd/containerd.sock`，docker → `/run/cri-dockerd/cri-dockerd.sock`）
+6. kubelet 启动时所有 image 拉取走 containerd mirror → `ko.local:5000`
+7. 等 Node Ready 后退出
 
 ### 3.2 加 master
 
@@ -483,9 +510,25 @@ systemctl status ko-registry.service
    vim /etc/systemd/system/ko-registry.service
    systemctl daemon-reload
    systemctl restart ko-registry
+
+   # cri-dockerd（docker runtime 节点）
+   vim /etc/systemd/system/cri-dockerd.service
+   systemctl daemon-reload
+   systemctl restart cri-dockerd
    ```
 
 > **注意**：手工改不持久（下次 ko init 会被覆盖）。如需持久化，建议提 issue 到 ko 仓库，把调优点做成 HCL config 可配置。
+
+### 4.5 cri-dockerd 排障（docker runtime 专用）
+
+`cri-dockerd` 是 k8s ≥ 1.24 + docker runtime 必需的 CRI shim（k8s 1.24 删了 in-tree dockershim）。kubelet 通过 `--container-runtime-endpoint=unix:///run/cri-dockerd/cri-dockerd.sock` 连它。常见坑：
+
+| 现象 | 根因 | 修法 |
+|---|---|---|
+| docker runtime 节点 kubelet 一直 NotReady | cri-dockerd 没起 / socket 不存在 | `systemctl status cri-dockerd` + `journalctl -u cri-dockerd -n 50` |
+| kubelet 日志 "connection refused" on cri socket | cri-dockerd 装好但 dockerd 没起（cri-dockerd 转发给 dockerd） | `systemctl status docker` + `dockerd` 启动日志 |
+| docker engine socket 在 `/var/run/docker.sock` 但 kubelet 还是连不上 | kubelet 配错 socket（k8s ≥ 1.24 dockershim 已删） | 检查 `/etc/systemd/system/kubelet.service.d/20-ko-offline.conf` 里有没有 `--container-runtime-endpoint=unix:///run/cri-dockerd/cri-dockerd.sock`；不能是 `/var/run/docker.sock` |
+| bundle 里没 cri-dockerd 层，docker runtime init 报错 | bundle 是 v0.0.4 或更早烤的 | 重烤：`ko vendor fetch && ko pack build`（v0.0.5+ 自动包含） |
 
 ## 4. 主机调优
 

@@ -387,6 +387,9 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 | `WIP` | v0.0.5 `ko node remove` / `ko reset` 离线清理补全：`/etc/hosts` ko.local 行 strip + registry service/binary/data/config 清理 |
 | `WIP` | v0.0.5 `--offline` 强制 `--bundle` 校验：init 启动时 upfront 拒绝 silent footgun |
 | `WIP` | v0.0.5 `ko pack build` 完后 operator 本机 docker/nerdctl 镜像存储自动清理（`ImagePuller.Remove`，`nerdctl rmi` / `docker rmi` 逐张删，best-effort）— 用户 2026-07-06 决策（节省 5-10 GB 本机磁盘） |
+| `WIP` | v0.0.5 mega-bundle：`third_party/` + `scripts/fetch-vendor.sh` + `internal/version/versions.go` + `ko vendor fetch/clean/paths`；`UpstreamDownloader` 改纯只读；`gatherLayers` 用 `version.*` 常量而非硬编码；`vendor-versions.env` 是 fetch 脚本的 source of truth，`TestVendorVersionsSync` 强制对齐 — 用户 2026-07-06 决策（"我要的就是有一个大包，安装 k8s 的时候能够加载这个包 来安装集群"） |
+| `WIP` | v0.0.5 cri-dockerd 集成：`NodeLifecycle.criSocket` docker 路径修 `/run/cri-dockerd/cri-dockerd.sock`（不再是 docker engine socket，k8s ≥ 1.24 dockershim 已删）；`InstallCRIDockerdFromBundle` + hardened systemd unit；`kubelet drop-in` runtime-aware，docker 时追加 `--container-runtime-endpoint=unix:///run/cri-dockerd/cri-dockerd.sock` |
+| `WIP` | v0.0.5 `docker.Installer.InstallOffline`：离线装 docker-ce（deb → rpm → static tgz fallback），零 `download.docker.com` 网络调用 |
 
 **v0.0.1 已发布** — tag 指向 `500731e`，release 产物：`ko-linux-amd64` / `ko-linux-arm64` / `ko-v0.0.1-multi.oci.tar.gz`（**注意**：v0.0.1 的 bundle 只含 containerd，真离线能力随 S17 发布）
 

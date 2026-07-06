@@ -5,6 +5,31 @@ ko 的所有重要变更都会记在这里。格式基于 [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Added — mega-bundle：单一 tar 包离线装 K8s（用户 2026-07-06 决策）
+
+- **核心目标**：用户明确要求"一个大包，安装 k8s 的时候能够加载这个包 来安装集群"。`ko pack build` 现在产出的是真正自包含的 offline bundle：containerd + kubeadm + kubelet + dockerd + cri-dockerd + registry 全部二进制 + k8s / cilium / prometheus 全部镜像 + helm charts 全部烤进一份 tar.gz，install 时零网络。
+- **`third_party/` 取代 `vendor/`**：asset 根目录改名为 `third_party/`，绕开 Go modules 的 vendor 目录命名冲突。`UpstreamDownloader` 现在是只读 view：只查本地路径，不再 HTTP 拉任何东西。
+- **单一版本源**：`internal/version/versions.go` 新增，集中 pin `ContainerdVersion` / `KubeVersion` / `KubeadmVersion` / `KubeletVersion` / `CRIDockerdVersion` / `RegistryVersion` / `DockerVersion` / `CiliumVersion` / `PrometheusStackVersion`。`vendor-versions.env` 是 fetch 脚本的 source of truth，`TestVendorVersionsSync` 强制两边对齐。
+- **fetch 脚本（committed）**：`scripts/fetch-vendor.sh` bash 3.2 兼容（macOS 自带版），per-asset 函数（`fetch_containerd` / `fetch_kubeadm` / `fetch_kubelet` / `fetch_cri_dockerd` / `fetch_docker` / `fetch_registry` / `fetch_k8s_images` / `fetch_cilium_images` / `fetch_prometheus_images` / `fetch_cilium_chart` / `fetch_prometheus_chart`），支持 `--print-paths` 干跑、`--clean` 全清。
+- **新 CLI 子命令**：`ko vendor fetch | clean | paths` — 调脚本，operator 不必手动 `bash scripts/...`。
+- **`third_party/` git-ignored**：操作员只 commit 代码 + 脚本 + 版本文件；asset 包按需下载，spec §4 改名为 third_party/。
+- **测试**：`TestRequireAsset_*` / `TestContainerd_PathLayout` / `TestRegistryBinary_StripsVPrefix` / `TestDockerStatic_ArchDirectory` / `TestDockerDeb_GlobHitsFile` / `TestK8sImagesTar_PathLayout` / `TestHelmCharts_PathLayout` / `TestVendorVersionsSync`。
+
+### Added — cri-dockerd 集成：k8s ≥ 1.24 + docker runtime 不再 100% 挂（v0.0.5）
+
+- **bug 修复**：`NodeLifecycle.criSocket` 把 docker runtime 路由到 `/var/run/docker.sock`（docker engine socket），但 k8s ≥ 1.24 已删 in-tree dockershim，kubelet 需要 CRI endpoint。改为 `/run/cri-dockerd/cri-dockerd.sock`，与 cri-dockerd（Mirantis v0.3.14）的 systemd unit socket 路径对齐。
+- **`InstallCRIDockerdFromBundle`**：新增离线安装路径 — bundle 烤 `cri-dockerd` 二进制 → 提取到 `/usr/local/bin/cri-dockerd` mode 0755 → 写 `/etc/systemd/system/cri-dockerd.service`（与 `ko-registry.service` 同形硬化：NoNewPrivileges / ProtectKernelTunables / PrivateTmp / RestrictNamespaces）+ `enable --now` + 等待 socket 出现 10s。`OfflineRunner.Run` 第 9a 步在 kubelet drop-in 之前按主机逐个调用（仅 docker runtime 主机）；`PrepareHostFromBundle` 同理。
+- **kubelet drop-in runtime-aware**：`KubeletDropIn(runtime)` 接 runtime 参数；docker 时追加 `--container-runtime-endpoint=unix:///run/cri-dockerd/cri-dockerd.sock`，containerd 默认不变。`SetClusterCfg` 把 `*config.File` 注入，使 `WriteKubeletDropIn` 仍只接 `(ctx, exec, host)` 即可渲染正确 drop-in（向后兼容）。
+- **`layerPaths` 新字段**：`Kubelet` + `CRIDockerd` + `classifyLayer` 两条新分支。`InstallRuntimeFromBundle` 通过 `installKubeletSnippet(l.Kubelet)` 嵌入 kubelet 安装片段（旧 bundle 没 kubelet 层时空字符串，零回归）。
+- **`hostRuntime(host)` helper**：解析 per-node override + 集群默认；`PrepareHostFromBundle` 据此决定是否装 cri-dockerd。
+- **测试**：`TestNodeLifecycle_Remove_DockerCRI` 改断言 + 反向断言（必须 NOT 走 `/var/run/docker.sock`）；`TestKubeletDropIn_DockerRuntime_PinsCRIDockerd` + `TestWriteKubeletDropIn_DockerRuntime_PinsCRIDockerd`；`TestOfflineRunner_InstallCRIDockerdFromBundle_BundlesHardenedUnit` + `TestOfflineRunner_InstallCRIDockerdFromBundle_MissingLayerErrors`；`TestOfflineRunner_HostRuntime_*` 三件套；`TestInstallRuntimeFromBundle_KubeletSnippet` 两子用例。
+
+### Added — `docker.Installer.InstallOffline` 离线安装路径（v0.0.5）
+
+- **`InstallOffline(ctx, host, debLayer, rpmLayer, staticLayer)`**：零网络安装 docker-ce。优先级：operator 手动下好的 `.deb` / `.rpm` > 下载站 `static tgz`（含 dockerd + docker + containerd）> 报错。deb 分支用 `dpkg -i --force-depends`；rpm 分支用 `dnf -y localinstall --nogpgcheck`（airgap 没 docker gpg key，RUNBOOK §4.1 标注信任权衡）；static 分支解压到 `/usr/local/bin/` + 写最小 `docker.service`。
+- **不变**：在线路径 `Install` / `installDebian` / `installRPM` 仍用 download.docker.com 仓库，作为 online fallback。
+- **测试**：`TestInstallOfflineBranch_DebianDebLayer` / `TestInstallOfflineBranch_DebianFallsBackToStatic` / `TestInstallOfflineBranch_RPMUsesNogpgcheck` / `TestInstallOfflineBranch_UnknownOSGoesToStatic` / `TestInstallOfflineBranch_NoLayerIsError` / `TestInstallOfflineBranch_NeverHitsDownloadDockerCom`（top-level airgap 保证，每分支不能含 `https://download.docker.com` / `curl https`）。
+
 ### Added — `ko pack build` 完后 operator 本机镜像自动清理（用户 2026-07-06 决策）
 
 - **删本机 docker/nerdctl store 的临时镜像**：每个 `puller.PullAll` + `puller.Save` 完成后，pack 调用 `puller.Remove` 把本机镜像存储里的 k8s / cilium / `registry:2` 镜像清掉。bundle 已经把这些 image 烤进自己的 docker-archive layer，本机 store 里的副本是纯垃圾
