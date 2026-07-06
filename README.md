@@ -204,12 +204,15 @@ docs/                       SPEC / PLAN / CHANGELOG
 
 | 版本 | 状态 | 目标 |
 |---|---|---|
+| **v0.0.5** | 📋 Unreleased | **registry 二进制 + systemd 硬化**（`ko-registry.service`）+ **containerd/kubelet 服务配置调优**（`max_concurrent_downloads`、`timeout` 等） |
 | v0.0.4 | ✅ 已发布（2026-07-02） | dedup 改按 blob 内容 sha256（更稳健） |
 | v0.0.3 | ✅ 已发布（2026-07-02） | bundle dedup 防御性 patch（`dedupDockerArchive`；当前 CI 是 no-op） |
 | v0.0.2 | ✅ 已发布（2026-07-02） | **真离线** — S17 自举 in-cluster registry；bundle 含 containerd/kubeadm/k8s-images/cilium-images |
 | v0.0.1 | 📦 历史 release | 首个可用版（bundle 仅含 containerd） |
 | v0.1.x | 📋 候选 | HA 外部 etcd / 切换到用户魔改 containerd / eBPF 自动检测 / SSO |
 | v0.2+ | 待定 | 看 v0.0.x 反馈决定 |
+
+**v0.0.5 重点**：S17 in-cluster registry 改用 static Go binary（`distribution/distribution` v2.8.3）运行，以 systemd 服务（`ko-registry.service`）托管，带资源限制（MemoryLimit=2G, CPUQuota=200%）和安全沙盒（User=nobody, ProtectSystem=strict, SystemCallFilter 等）。同时对 containerd 服务做配置调优（`max_concurrent_downloads=3`, `timeout=30s`, `disable_snapshot_annotations=false`），提升 offline airgap 场景稳定性。
 
 ## License
 

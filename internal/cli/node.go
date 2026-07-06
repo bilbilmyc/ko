@@ -30,7 +30,13 @@ func newNodeCmd() *cobra.Command {
 // loadNodeLifecycle parses config, builds an SSH executor, and returns a
 // NodeLifecycle ready to use. It assumes the cluster has already been
 // initialised (kubeconfig present in KO_CACHE_HOME/kube/admin.conf).
-func loadNodeLifecycle(_ *cobra.Command) (*cluster.NodeLifecycle, *config.File, func(), error) {
+//
+// If `offlineBundle` is non-empty, the returned NodeLifecycle is wired with
+// an OfflineRunner so AddWorker/AddMaster follow the airgap path (containerd
+// + kubeadm installed from the bundle, containerd mirror → ko.local,
+// /etc/hosts entry, kubelet drop-in, kubeadm join with
+// --image-repository=ko.local:5000).
+func loadNodeLifecycle(_ *cobra.Command, offlineBundle string) (*cluster.NodeLifecycle, *config.File, func(), error) {
 	cfgPath := flags.ConfigPath
 	if cfgPath == "" {
 		return nil, nil, nil, fmt.Errorf("--config is required")
@@ -57,13 +63,27 @@ func loadNodeLifecycle(_ *cobra.Command) (*cluster.NodeLifecycle, *config.File, 
 	arch := ""
 	cache := filepath.Join(homeDir(), ".ko", "cache", "containerd")
 	ctdInstaller := containerd.NewInstaller(exec, cfg.Containerd.Version, cfg.Containerd.Source, arch, cache)
-	dckInstaller := docker.NewInstaller(exec, "27.5.1", "stable")
+	dckInstaller := docker.NewInstaller(exec, "", "stable")
 
 	nl := cluster.NewNodeLifecycle(cfg, exec, kb, filepath.Join(homeDir(), ".ko", "kube", "admin.conf"))
-	nl.InstallContainerd = func(ctx context.Context, host string) error {
-		return ctdInstaller.Install(ctx, host, containerd.DefaultConfig(cfg.Image.RegistryMirrors, cfg.Image.InsecureRegistries))
+	if offlineBundle != "" {
+		master1 := ""
+		if len(cfg.Nodes.Masters) > 0 {
+			master1 = cfg.Nodes.Masters[0]
+		}
+		nl.OfflineRunner = &cluster.OfflineRunner{
+			Cfg:     cfg,
+			Exec:    exec,
+			Bundle:  offlineBundle,
+			Master1: master1,
+		}
+		nl.LocalRegistryOverride = nl.OfflineRunner.LocalRegistry()
+	} else {
+		nl.InstallContainerd = func(ctx context.Context, host string) error {
+			return ctdInstaller.Install(ctx, host, containerd.DefaultConfig(containerd.MirrorsFromDockerEndpointURLs(cfg.Image.RegistryMirrors), cfg.Image.InsecureRegistries))
+		}
+		nl.InstallDocker = dckInstaller.Install
 	}
-	nl.InstallDocker = dckInstaller.Install
 	return nl, cfg, func() { _ = exec.Close() }, nil
 }
 
@@ -72,7 +92,7 @@ func newNodeListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List cluster nodes",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			nl, _, closer, err := loadNodeLifecycle(cmd)
+			nl, _, closer, err := loadNodeLifecycle(cmd, "")
 			if err != nil {
 				return err
 			}
@@ -92,12 +112,13 @@ func newNodeListCmd() *cobra.Command {
 
 func newNodeAddCmd() *cobra.Command {
 	var asMaster bool
+	var offlineBundle string
 	cmd := &cobra.Command{
 		Use:   "add <host>",
 		Short: "Add a node (worker by default, --master for control-plane)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			nl, _, closer, err := loadNodeLifecycle(cmd)
+			nl, _, closer, err := loadNodeLifecycle(cmd, offlineBundle)
 			if err != nil {
 				return err
 			}
@@ -122,6 +143,7 @@ func newNodeAddCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&asMaster, "master", false, "add as control-plane node (HA)")
+	cmd.Flags().StringVar(&offlineBundle, "bundle", "", "path to a ko OCI bundle (.oci.tar.gz) — airgap add: install containerd/kubeadm from bundle, mirror to in-cluster registry")
 	return cmd
 }
 
@@ -132,7 +154,7 @@ func newNodeRemoveCmd() *cobra.Command {
 		Short: "Drain, delete, and reset a node",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			nl, _, closer, err := loadNodeLifecycle(cmd)
+			nl, _, closer, err := loadNodeLifecycle(cmd, "")
 			if err != nil {
 				return err
 			}
@@ -156,7 +178,7 @@ func newNodeLabelCmd() *cobra.Command {
 		Short: "Apply a label to a node",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			nl, _, closer, err := loadNodeLifecycle(cmd)
+			nl, _, closer, err := loadNodeLifecycle(cmd, "")
 			if err != nil {
 				return err
 			}

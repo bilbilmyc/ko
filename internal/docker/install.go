@@ -55,7 +55,14 @@ func (i *Installer) detectOS(ctx context.Context, host string) string {
 }
 
 func (i *Installer) installDebian(ctx context.Context, host string) error {
-	logger.Info("installing docker-ce on debian-family host", "host", host, "version", i.Version)
+	logger.Info("installing docker-ce on debian-family host", "host", host, "version", i.Version, "channel", i.Channel)
+	// If Version is empty (the v0.0.5 default — track latest), skip the
+	// `=VERSION` pin so apt installs whatever the channel carries. Pinning
+	// to an empty string would be a syntax error.
+	pkgPin := ""
+	if i.Version != "" {
+		pkgPin = fmt.Sprintf("=%s", i.Version)
+	}
 	script := fmt.Sprintf(`set -euo pipefail
 if ! command -v docker >/dev/null 2>&1 || ! docker --version | grep -q "%s"; then
   apt-get update
@@ -65,12 +72,12 @@ if ! command -v docker >/dev/null 2>&1 || ! docker --version | grep -q "%s"; the
   chmod a+r /etc/apt/keyrings/docker.gpg
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(. /etc/os-release && echo "$ID") $(. /etc/os-release && echo "$VERSION_CODENAME") %s" > /etc/apt/sources.list.d/docker.list
   apt-get update
-  apt-get install -y docker-ce=%s docker-ce-cli=%s containerd.io docker-buildx-plugin docker-compose-plugin
+  apt-get install -y docker-ce%s docker-ce-cli%s containerd.io docker-buildx-plugin docker-compose-plugin
 fi
 systemctl enable docker
 systemctl restart docker
 systemctl is-active docker
-`, i.Version, i.Channel, i.Version, i.Version)
+`, i.Version, i.Channel, pkgPin, pkgPin)
 	res := i.Exec.Run(ctx, host, script)
 	if res.Failed() {
 		return fmt.Errorf("apt install docker-ce: %w", res.Err)
@@ -79,17 +86,28 @@ systemctl is-active docker
 }
 
 func (i *Installer) installRPM(ctx context.Context, host string) error {
-	logger.Info("installing docker-ce on rpm-family host", "host", host, "version", i.Version)
+	logger.Info("installing docker-ce on rpm-family host", "host", host, "version", i.Version, "channel", i.Channel)
+	// dnf install with no version suffix installs the latest matching the
+	// enabled repo, so empty Version means "track channel latest".
+	ceVersion := i.Version
+	cliVersion := i.Version
+	if i.Version != "" {
+		ceVersion = "docker-ce-" + i.Version
+		cliVersion = "docker-ce-cli-" + i.Version
+	} else {
+		ceVersion = "docker-ce"
+		cliVersion = "docker-ce-cli"
+	}
 	script := fmt.Sprintf(`set -euo pipefail
 if ! command -v docker >/dev/null 2>&1 || ! docker --version | grep -q "%[1]s"; then
   dnf -y install dnf-plugins-core
   dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-  dnf -y install docker-ce-%[1]s docker-ce-cli-%[1]s containerd.io docker-buildx-plugin docker-compose-plugin
+  dnf -y install %[2]s %[3]s containerd.io docker-buildx-plugin docker-compose-plugin
 fi
 systemctl enable docker
 systemctl restart docker
 systemctl is-active docker
-`, i.Version)
+`, i.Version, ceVersion, cliVersion)
 	res := i.Exec.Run(ctx, host, script)
 	if res.Failed() {
 		return fmt.Errorf("dnf install docker-ce: %w", res.Err)

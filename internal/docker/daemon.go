@@ -18,7 +18,11 @@ type DaemonConfig struct {
 const (
 	defaultCgroupDriver = "systemd"
 	defaultLogDriver    = "json-file"
-	defaultVersion      = "27.5.1"
+	// defaultVersion is intentionally empty — v0.0.5+ tracks latest docker-ce
+	// from the configured channel instead of pinning to 27.5.1. Operators
+	// who need a specific pin set cfg.Docker.Version in HCL or pass the
+	// explicit version to NewInstaller.
+	defaultVersion = ""
 )
 
 func DefaultDaemon(mirrors, insecure []string) string {

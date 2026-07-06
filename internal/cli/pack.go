@@ -160,12 +160,24 @@ func buildMultiArch(cmd *cobra.Command, cacheDir, outputDir, version string) err
 // are downgraded to warnings so a flaky network doesn't block the whole
 // pack; the caller validates len(layers) > 0. Defaults are pinned to the
 // versions ko's other components expect (defaultK8sVersion, defaultCiliumVersion).
+//
+// containerd and docker versions are NOT pinned — we ask the GitHub API
+// for the latest non-prerelease tag at pack time, so airgap installs track
+// upstream stable automatically. The latest-tag lookup is cached under
+// ~/.ko/cache for 24h so repeat builds don't hammer the GitHub API.
+// Operator can still pin via HCL or --containerd-version / --docker-version.
 func gatherLayers(cmd *cobra.Command, dl *image.UpstreamDownloader, cacheDir, arch string) ([]image.LayerSource, error) {
 	layers := []image.LayerSource{}
 
-	ctd, err := dl.Containerd(cmd.Context(), "v2.0.5", arch)
+	ctdVersion, err := dl.LatestContainerdVersion(cmd.Context())
 	if err != nil {
-		logger.Warn("containerd download failed (skipping)", "arch", arch, "err", err)
+		logger.Warn("containerd latest-tag lookup failed; falling back to v2.1.0", "err", err)
+		ctdVersion = "v2.1.0"
+	}
+	logger.Info("containerd version for bundle", "version", ctdVersion)
+	ctd, err := dl.Containerd(cmd.Context(), ctdVersion, arch)
+	if err != nil {
+		logger.Warn("containerd download failed (skipping)", "arch", arch, "version", ctdVersion, "err", err)
 	} else {
 		layers = append(layers, image.LayerSource{
 			SrcPath: ctd, MediaType: image.MediaTypeKoContainerdTar,
@@ -196,6 +208,15 @@ func gatherLayers(cmd *cobra.Command, dl *image.UpstreamDownloader, cacheDir, ar
 	} else {
 		layers = append(layers, image.LayerSource{
 			SrcPath: reg, MediaType: image.MediaTypeKoRegistryImage,
+		})
+	}
+
+	regBin, err := dl.RegistryBinary(cmd.Context(), image.DefaultRegistryVersion, arch)
+	if err != nil {
+		logger.Warn("registry binary pack failed (skipping)", "arch", arch, "err", err)
+	} else {
+		layers = append(layers, image.LayerSource{
+			SrcPath: regBin, MediaType: image.MediaTypeKoRegistryBinary,
 		})
 	}
 

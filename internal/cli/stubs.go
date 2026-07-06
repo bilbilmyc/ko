@@ -42,6 +42,15 @@ of running an actual init. Profiles: single | ha | external-etcd.`,
 				return runGenerateConfig(cmd, generateConfig, profile, outputPath, forceOverwrite)
 			}
 
+			// v0.0.5: --offline without --bundle is a silent footgun.
+			// Without a bundle, OfflineRunner.Run can't install containerd /
+			// kubeadm / start the in-cluster registry; init would still
+			// proceed but fail mid-way with a confusing `bundle is required`
+			// error. Reject up front.
+			if (offline || flags.Offline) && bundle == "" {
+				return fmt.Errorf("--offline requires --bundle <path-to-oci-tar.gz>; see `ko pack build` to produce one")
+			}
+
 			cfgPath := flags.ConfigPath
 			if cfgPath == "" {
 				return fmt.Errorf("--config is required")

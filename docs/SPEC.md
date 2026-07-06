@@ -550,7 +550,7 @@ return errors.New("ssh failed")
 
 **v0.0.1（首个可用版）**：
 
-- [ ] `ko init --offline --bundle <bundle.tar.gz>` 在 3 master + 3 worker 拓扑上 5 分钟内完成
+- [ ] `ko init --offline --bundle <bundle.tar.gz>` 在 3 master + 3 worker 拓扑上 5 分钟内完成（kind 实测；真机实测）
 - [ ] `ko init --offline` 生成的集群 `kubectl get nodes` 全 Ready
 - [ ] 运行时可切：`--runtime=containerd`（upstream v2 latest）和 `--runtime=docker` 两条路径都 e2e 通过
 - [ ] **amd64 + arm64 各跑通一次 e2e**（在 arm 物理机或 qemu-aarch64 模拟器中）

@@ -36,6 +36,78 @@ func NewUpstream(cacheDir string) *UpstreamDownloader {
 	}
 }
 
+// LatestContainerdVersion queries the GitHub API for the latest non-prerelease
+// containerd release and returns its tag (e.g. "v2.1.0"). Used as the default
+// version when packing a bundle so airgap installs track upstream stable
+// without operator intervention. Override with a fixed version via HCL or
+// CLI flag.
+//
+// The response is cached in CacheDir so repeated pack builds on the same
+// day don't hammer the GitHub API.
+func (u *UpstreamDownloader) LatestContainerdVersion(ctx context.Context) (string, error) {
+	return u.latestGitHubTag(ctx, "containerd", "containerd", "containerd-latest.txt")
+}
+
+// LatestDockerVersion queries the GitHub API for the latest non-prerelease
+// moby/moby release and returns its tag (e.g. "v28.0.0"). Same caching +
+// override semantics as LatestContainerdVersion.
+func (u *UpstreamDownloader) LatestDockerVersion(ctx context.Context) (string, error) {
+	return u.latestGitHubTag(ctx, "moby", "moby", "docker-latest.txt")
+}
+
+// latestGitHubTag hits https://api.github.com/repos/<owner>/<repo>/releases/latest,
+// parses out tag_name, and caches it under CacheDir/<cacheFile>. The cache
+// file is read on every call — pack builds are infrequent enough that the
+// staleness cost is negligible, and we avoid a network round-trip when
+// nothing has moved upstream.
+func (u *UpstreamDownloader) latestGitHubTag(ctx context.Context, owner, repo, cacheFile string) (string, error) {
+	dest := filepath.Join(u.CacheDir, cacheFile)
+	if st, err := os.Stat(dest); err == nil && st.Size() > 0 && time.Since(st.ModTime()) < 24*time.Hour {
+		b, err := os.ReadFile(dest)
+		if err == nil {
+			tag := strings.TrimSpace(string(b))
+			if tag != "" {
+				return tag, nil
+			}
+		}
+	}
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", owner, repo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := u.HTTP.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("github api %s/%s: %w", owner, repo, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("github api %s/%s: HTTP %d", owner, repo, resp.StatusCode)
+	}
+	var payload struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", fmt.Errorf("github api %s/%s decode: %w", owner, repo, err)
+	}
+	tag := strings.TrimSpace(payload.TagName)
+	if tag == "" {
+		return "", fmt.Errorf("github api %s/%s: empty tag_name", owner, repo)
+	}
+	if err := os.MkdirAll(u.CacheDir, 0o755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(dest, []byte(tag), 0o644); err != nil {
+		// Caching is best-effort; the caller still gets the right tag.
+		logger.Warn("latest-tag cache write failed", "path", dest, "err", err)
+	}
+	return tag, nil
+}
+
+// errUnexpected is a sentinel for "API succeeded but response was unusable".
+// We don't use errors.New at package level to keep this small.
+
 // Containerd downloads the upstream containerd tarball for the given
 // arch and version (e.g. "v2.0.5"). Returns the local path.
 func (u *UpstreamDownloader) Containerd(ctx context.Context, version, arch string) (string, error) {
@@ -140,6 +212,101 @@ func (u *UpstreamDownloader) RegistryImage(ctx context.Context, arch string) (st
 	}
 	logger.Info("registry image tar written", "dest", dest, "size_bytes", mustStat(dest))
 	return dest, nil
+}
+
+// DefaultRegistryVersion is the upstream distribution/distribution tag ko
+// pins the in-cluster registry binary to. v2.8.3 is the latest 2.x release
+// line that ships a static Go binary and matches registry:2 image tags.
+const DefaultRegistryVersion = "2.8.3"
+
+// RegistryBinary downloads the static `registry` Go binary for the given
+// arch from https://github.com/distribution/distribution/releases (e.g.
+// registry_2.8.3_linux_amd64.tar.gz) and wraps it in a tar.gz that contains
+// a single ./registry entry — same pattern as Kubeadm(). Offline init
+// extracts this to /usr/local/bin/registry and runs it under a hardened
+// systemd unit instead of `nerdctl run registry:2`.
+func (u *UpstreamDownloader) RegistryBinary(ctx context.Context, version, arch string) (string, error) {
+	v := strings.TrimPrefix(version, "v")
+	url := fmt.Sprintf("https://github.com/distribution/distribution/releases/download/v%s/registry_%s_linux_%s.tar.gz", v, v, arch)
+	dest := filepath.Join(u.CacheDir, "registry-bin", fmt.Sprintf("registry-%s-linux-%s.tar.gz", v, arch))
+	if st, err := os.Stat(dest); err == nil && st.Size() > 0 {
+		logger.Info("registry binary cached", "path", dest)
+		return dest, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return "", err
+	}
+	tmp := dest + ".part"
+	if err := downloadFile(ctx, u.HTTP, url, tmp); err != nil {
+		return "", fmt.Errorf("registry binary: %w", err)
+	}
+	// The release tarball is a plain tar.gz whose root entry is `./registry`.
+	// Unwrap it to a single file and re-wrap via wrapBinaryAsTarGz so the
+	// bundle layer shape matches the kubeadm layer (one ./<name> entry).
+	bin, err := extractSingleBinary(tmp, "registry")
+	if err != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("registry binary extract: %w", err)
+	}
+	if err := wrapBinaryAsTarGz(bin, dest, "registry"); err != nil {
+		_ = os.Remove(tmp)
+		_ = os.Remove(bin)
+		return "", fmt.Errorf("registry binary wrap: %w", err)
+	}
+	_ = os.Remove(tmp)
+	_ = os.Remove(bin)
+	logger.Info("registry binary downloaded", "url", url, "dest", dest)
+	return dest, nil
+}
+
+// extractSingleBinary reads srcTarGz and writes the first regular-file entry
+// whose name matches wantName to a temp file. Returns the temp path.
+func extractSingleBinary(srcTarGz, wantName string) (string, error) {
+	in, err := os.Open(srcTarGz)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
+	gz, err := gzip.NewReader(in)
+	if err != nil {
+		return "", err
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			return "", fmt.Errorf("no %q entry in %s", wantName, srcTarGz)
+		}
+		if err != nil {
+			return "", err
+		}
+		base := filepath.Base(h.Name)
+		if base != wantName {
+			continue
+		}
+		if h.Typeflag != tar.TypeReg {
+			return "", fmt.Errorf("%s: entry %s is not a regular file (type=%d)", srcTarGz, h.Name, h.Typeflag)
+		}
+		tmp, err := os.CreateTemp("", "ko-registry-bin-")
+		if err != nil {
+			return "", err
+		}
+		if _, err := io.Copy(tmp, tr); err != nil {
+			tmp.Close()
+			os.Remove(tmp.Name())
+			return "", err
+		}
+		if err := tmp.Close(); err != nil {
+			os.Remove(tmp.Name())
+			return "", err
+		}
+		if err := os.Chmod(tmp.Name(), 0o755); err != nil {
+			os.Remove(tmp.Name())
+			return "", err
+		}
+		return tmp.Name(), nil
+	}
 }
 
 // CiliumChartTGZ downloads the cilium helm chart tarball directly from

@@ -28,6 +28,7 @@ const (
 	MediaTypeKoK8sImagesTar   = "application/vnd.ko.layer.k8s.images.tar.v1"
 	MediaTypeKoCiliumImagesTar = "application/vnd.ko.layer.cilium.images.tar.v1"
 	MediaTypeKoRegistryImage  = "application/vnd.ko.layer.registry.image.v1+docker.archive"
+	MediaTypeKoRegistryBinary = "application/vnd.ko.layer.registry.binary.v1+tar.gz"
 	MediaTypeKoKubeadmBinary  = "application/vnd.ko.layer.kubeadm.binary.v1+tar.gz"
 
 	MediaTypeOCIImageIndex   = "application/vnd.oci.image.index.v1+json"

@@ -175,6 +175,20 @@ done
 rm -f  /etc/containerd/config.toml
 rm -f  /etc/docker/daemon.json
 rm -rf /etc/systemd/system/kubelet.service.d
+# /etc/hosts ko.local entry — written by OfflineRunner.writeHosts for
+# airgap so every node resolves the in-cluster registry. After reset,
+# the IP it pointed at may be dead (or the host may be re-init'd into
+# a new cluster). Strip the line; if the host is being re-added with
+# "ko node add", that path rewrites it idempotently.
+sed -i '/[[:space:]]ko\.local$/d' /etc/hosts 2>/dev/null || true
+# v0.0.5 in-cluster registry — installed by OfflineRunner.startRegistry
+# on master-1 only. All lines are no-ops on non-master hosts where the
+# files / unit never existed; the || true guards cover every case.
+systemctl disable --now ko-registry.service 2>/dev/null || true
+rm -f  /etc/systemd/system/ko-registry.service
+rm -rf /var/lib/ko-registry
+rm -f  /usr/local/bin/registry
+rm -f  /etc/registry-config.yml
 
 # 8. External-etcd artefacts. Per-member data dirs live under
 #    /var/lib/etcd/<member> (stacked gets the lot, but we already

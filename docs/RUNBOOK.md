@@ -28,34 +28,42 @@ S17 之后，离线部署才真的"全离线"：bundle 里同时烤了 `containe
 ### 1.1 bundle 里到底有什么
 
 ```
-dist/ko-v0.0.4-multi.oci.tar.gz        # multi-arch OCI image layout
+dist/bundle-k8s1.32.0-cilium1.16.1-20260705-multi.oci.tar.gz
 ├─ index.json                          # 顶层：2 个 arch manifest
 ├─ oci-layout
 └─ blobs/sha256/
    ├─ <amd64 manifest>
-   │   ├─ containerd-2.0.5-linux-amd64.tar.gz
-   │   ├─ kubeadm-v1.32.0-linux-amd64.tar.gz   ← kubeadm/kubelet/kubectl 静态二进制
-   │   ├─ k8s-1.32.0-amd64.tar                 ← kube-apiserver/controller-manager/
-   │   │                                        scheduler/proxy/coredns/pause/etcd
-   │   ├─ registry-2-linux-amd64.tar           ← registry:2 仓库镜像本身
-   │   ├─ cilium-1.16.1-images.tar             ← cilium/operator/hubble/...
-   │   └─ cilium-1.16.1.tgz                    ← helm chart
-   └─ <arm64 manifest>                          （chart/k8s-images/registry 跨架构去重）
+   │   ├─ containerd-<latest>-linux-amd64.tar.gz      ← pack 时 fetch latest stable（v0.0.5+）
+   │   ├─ kubeadm-v1.32.0-linux-amd64.tar.gz          ← kubeadm 静态二进制
+   │   ├─ k8s-1.32.0-amd64.tar                       ← kube-apiserver/controller-manager/
+   │   │                                              scheduler/proxy/coredns/pause/etcd
+   │   ├─ registry-2-linux-amd64.tar                 ← registry:2 镜像（备选，不再主用）
+   │   ├─ registry-2.8.3-linux-amd64.tar.gz          ← static Go 二进制（主用）
+   │   ├─ cilium-1.16.1-images.tar                   ← cilium/operator/hubble/...
+   │   └─ cilium-1.16.1.tgz                          ← helm chart
+   └─ <arm64 manifest>                                （chart/k8s-images/registry 跨架构去重）
 ```
 
 每层都是独立 mediaType（`vnd.ko.layer.*`），operator 用 `ko pack inspect <bundle>` 看。
 
+**v0.0.5+ containerd / docker 版本追踪**：
+
+- `ko pack build` 不再写死 containerd 版本。默认调 GitHub API `repos/containerd/containerd/releases/latest` 拿 tag（如 `v2.0.5` / `v2.1.0`），24h cache 到 `~/.ko/cache/containerd-latest.txt`。GitHub 不可达退到 `v2.1.0` 而不是 fail
+- docker CE 不在 GitHub release 走（apt 渠道），改为 `apt install docker-ce`（channel=stable 默认装最新），不再写死 `27.5.1`。HCL `docker.version` 仍可显式 pin
+- bundle 一旦烤完，containerd 版本冻结（registry 二进制、kubeadm 静态二进制同理）。新版本要重烤
+
 ### 1.2 在能上网的机器上打包
 
 ```bash
-ko pack build --arch all --output ./dist --version v0.0.4
-# 产物：dist/ko-v0.0.4-multi.oci.tar.gz  (amd64 bundle ~826M；含 containerd + kubeadm + k8s 控制面镜像 + registry:2 + cilium 全部镜像)
+ko pack build --arch all --output ./dist --version bundle-k8s1.32.0-cilium1.16.1-20260705
+# 产物：dist/bundle-k8s1.32.0-cilium1.16.1-20260705-multi.oci.tar.gz  (amd64 bundle ~826M；含 containerd + kubeadm + k8s 控制面镜像 + registry 静态二进制 + cilium 全部镜像)
+# 注：containerd 层文件名会反映 pack 当天的 latest tag（如 containerd-2.0.5-linux-amd64.tar.gz）
 ```
 
 如果只想给一种架构烤：
 
 ```bash
-ko pack build --arch amd64 --output ./dist --version v0.0.4
+ko pack build --arch amd64 --output ./dist --version bundle-k8s1.32.0-cilium1.16.1-20260705
 ```
 
 烤好的 bundle 推到**公司内部存储**（HTTP / NFS / MinIO 等 — 待选型，见 PLAN §8.6），交付时与 ko 二进制一起给到目标机器。详细流程见 §2.8 交付物。
@@ -128,48 +136,50 @@ cni     { plugin  = "cilium" }
 
 ```bash
 # 1. 从 NFS 拿 bundle
-scp /mnt/ko-store/bundle-k8s1.32.0-cilium1.16.1-20260702-multi.oci.tar.gz .
+cp /mnt/ko-store/bundle-k8s1.32.0-cilium1.16.1-20260705-multi.oci.tar.gz .
 
 # 2. 从 GitHub release 拿 ko 二进制（或本地 make build）
-wget https://github.com/bilbilmyc/ko/releases/download/v0.0.4/ko-linux-amd64
+wget https://github.com/bilbilmyc/ko/releases/download/v0.0.5/ko-linux-amd64
 chmod +x ko-linux-amd64
 
 # 3. 打交付物 tar（含 ko + bundle + 三个 profile 模板；TODO: #65 完成后此命令可用）
 ./ko pack ship \
-  --output ko-delivery-v0.0.4.tar.gz \
-  --bundle ./bundle-k8s1.32.0-cilium1.16.1-20260702-multi.oci.tar.gz \
+  --output ko-delivery-v0.0.5.tar.gz \
+  --bundle ./bundle-k8s1.32.0-cilium1.16.1-20260705-multi.oci.tar.gz \
   --include-configs
-# 产物：ko-delivery-v0.0.4.tar.gz
-#   ├─ ko-linux-amd64              ← ko 二进制（来自 GitHub release v0.0.4）
-#   ├─ bundle-k8s1.32.0-cilium1.16.1-20260702-multi.oci.tar.gz  ← 来自 NFS
+# 产物：ko-delivery-v0.0.5.tar.gz
+#   ├─ ko-linux-amd64              ← ko 二进制（来自 GitHub release v0.0.5）
+#   ├─ bundle-k8s1.32.0-cilium1.16.1-20260705-multi.oci.tar.gz  ← 来自 NFS
 #   ├─ cluster.hcl.single
 #   ├─ cluster.hcl.ha
 #   └─ cluster.hcl.external-etcd
 
 # 4. 推到 master-1
-scp ko-delivery-v0.0.4.tar.gz root@10.0.0.11:
+scp ko-delivery-v0.0.5.tar.gz root@10.0.0.11:
 
 # 5. 在 master-1 解 tar
-ssh root@10.0.0.11 'mkdir ko-delivery && tar -xzf ko-delivery-v0.0.4.tar.gz -C ko-delivery'
+ssh root@10.0.0.11 'mkdir ko-delivery && tar -xzf ko-delivery-v0.0.5.tar.gz -C ko-delivery'
 ```
 
 ### 1.6 离线 init
 
 ```bash
 ssh root@10.0.0.11
-./ko init --config cluster.hcl --offline --bundle ./ko-v0.0.4-multi.oci.tar.gz
+./ko init --config cluster.hcl --offline --bundle ./bundle-k8s1.32.0-cilium1.16.1-20260705-multi.oci.tar.gz
 ```
 
 `--offline` 让 ko 走 `OfflineRunner`（`internal/cluster/offline.go`），流程：
 
 1. **scp + 解包**：bundle 传到 master-1 的 `/tmp/ko-bundle.oci.tar.gz`，解到 `/var/lib/ko/bundle/`
-2. **按 mediaType 找各 layer**：从 `index.json` → manifest → `blobs/sha256/<digest>` 一路定位 `containerd` / `kubeadm` / `k8s-images` / `registry-image` / `cilium-images` / `cilium-chart`
-3. **装 runtime + kubeadm**：解 containerd 到 `/usr/local`，解 kubeadm 后 `install -m 0755 /usr/local/bin/kubeadm`，`systemctl enable --now containerd`
+2. **按 mediaType 找各 layer**：从 `index.json` → manifest → `blobs/sha256/<digest>` 一路定位 `containerd` / `kubeadm` / `k8s-images` / `cilium-images` / `cilium-chart` / `registry-binary`
+3. **装 runtime + kubeadm + containerd tune**：解 containerd 到 `/usr/local`，解 kubeadm 后 `install -m 0755 /usr/local/bin/kubeadm`，生成 `containerd config.toml` 并应用 tune（`max_concurrent_downloads`、`timeout`、`disable_snapshot_annotations`），`systemctl enable --now containerd`
 4. **写 containerd mirror**：给 `quay.io` / `registry.k8s.io` / `docker.io` / `ghcr.io` 各加一个 `registry.mirrors."<host>"` 指向 `http://ko.local:5000`；`ko.local:5000` 自己标 `insecure_skip_verify = true`
-5. **`ctr -n=k8s.io images import`** 拉 k8s-images / registry-image / cilium-images 进 host containerd
-6. **起 in-cluster registry**：`nerdctl run -d --name ko-registry --net=host --restart=always -v /var/lib/ko-registry:/var/lib/registry registry:2`，`curl /v2/` 轮询 30s 确认就绪
-7. **retag + push**：每个镜像 `ctr -n=k8s.io images tag <upstream> ko.local:5000/<repo>` + `ctr -n=k8s.io images push --plain-http ko.local:5000 <target>`
+5. **`ctr -n=k8s.io images import`** 拉 k8s-images / cilium-images 进 host containerd（registry-binary 不需要 import，是静态二进制）
+6. **起 in-cluster registry**：从 bundle 解 `registry` 二进制到 `/usr/local/bin/registry`，以 `systemd` 服务运行（硬化的 `ko-registry.service`，带资源限制和安全沙盒），监听 `:5000`（host network）+ `:5001`（debug/prometheus），`curl /v2/` 轮询 30s 确认就绪
+7. **retag + push**：每个镜像 `ctr -n=k8s.io images tag <upstream> ko.local:5000/<repo>` + `ctr -n=k8s.io images push --plain-http ko.local:5000 <target>`（并发 5 + 重试 3 + 间隔 2s）
 8. **写 hosts**：解析 master-1 的 `ip -4 -o addr show`，把 `<master-1-IP> ko.local` 写到每个 master + worker 的 `/etc/hosts`（幂等：`grep -qF` 守卫）
+9. **kubelet drop-in**：写 `/etc/systemd/system/kubelet.service.d/20-ko-offline.conf` 把 `KUBELET_KUBEADM_ARGS` 覆盖为 airgap image-pull-deadline=30m + registry QPS + eviction 阈值；`systemctl daemon-reload`
+10. **清临时文件 + ctr cache**：pushImages 完成、`wait` 后给每个 push 过的 image 跑 `ctr images unset` + `ctr images rm`（source + target tag），再 `rm -f /tmp/ko-bundle.oci.tar.gz`。registry 已经是 source of truth，本地 ctr cache 是纯复制；master-1 disk 一般 <100G，必须让出来。`/var/lib/ko/bundle/` 保留（reset --purge 才删）
 
 然后回到正常 init 流程：
 - kubeadm init 时 `--image-repository=ko.local:5000`，所有控制面镜像从本地拉
@@ -183,19 +193,32 @@ ssh root@10.0.0.11
 init 完后，到 master-1 上：
 
 ```bash
-# 1. registry 起来了
+# 1. registry 起来了（HTTP，in-cluster only）
 curl -sS http://ko.local:5000/v2/_catalog
 # {"repositories":["cilium/cilium","cilium/certgen",...,"coredns/coredns",...]}
 
-# 2. kubeadm 拉镜像从本地走（不应有公网 IP 出现）
+# 2. registry 运行在 systemd（查看资源限制 / 安全沙盒配置）
+systemctl status ko-registry.service
+# 可以看到 MemoryLimit=2G、CPUQuota=200%、User=65534（nobody）等
+
+# 3. kubeadm 拉镜像从本地走（不应有公网 IP 出现）
 crictl images | grep ko.local:5000
 # ko.local:5000/coredns/coredns       v1.11.3
 # ko.local:5000/etcd                  3.5.16-0
 # ...
 
-# 3. 每个节点的 /etc/hosts 都有 ko.local
+# 4. containerd 镜像配置确认（registry mirror 已生效）
+containerd config dump | grep -A 2 "mirrors.*registry.k8s.io"
+# endpoint = ["http://ko.local:5000"]
+
+# 5. 每个节点的 /etc/hosts 都有 ko.local
 for h in m1 m2 m3 w1 w2; do ssh $h "grep ko.local /etc/hosts"; done
 # 10.0.0.11 ko.local
+
+# 6. kubelet 配置 tune（可选验证：如果 init 前写了 tune，这里能看到）
+cat /var/lib/kubelet/kubeadm-flags.env
+# --container-runtime-endpoint=unix:///run/containerd/containerd.sock
+# （其他 tune 项如 --eviction-hard 会体现在 kubelet 配置里）
 ```
 
 ### 1.8 HA 集群的 ko.local 解析（可选）
@@ -230,10 +253,10 @@ sudo kubeadm init phase certs all --certificate-validity=876000h
 bundle 是不可变的（每个 bundle 一个 OCI digest）。新版本重打：
 
 ```bash
-ko pack build --arch all --output ./dist --version v0.0.5
+ko pack build --arch all --output ./dist --version bundle-k8s1.32.0-cilium1.16.1-20260705
 ```
 
-bundle 跨架构会做内容可寻址去重（cilium chart / k8s-images / registry 三个 layer 在 amd64+arm64 之间 sha256 完全相同），所以只升一个架构的 patch 时实际增量大都来自架构特定的 binary。
+bundle 跨架构会做内容可寻址去重（cilium chart / k8s-images / registry 二进制三个 layer 在 amd64+arm64 之间 sha256 完全相同），所以只升一个架构的 patch 时实际增量大都来自架构特定的 binary。
 
 ## 2. 在线部署（备选 / 不推荐）
 
@@ -293,7 +316,7 @@ ko init --config cluster.hcl
 
 ```bash
 # 离线模式（项目主用）
-ko node add 10.0.0.24 --role worker --config cluster.hcl --offline --bundle ./ko-v0.0.4-multi.oci.tar.gz
+ko node add 10.0.0.24 --role worker --config cluster.hcl --offline --bundle ./bundle-k8s1.32.0-cilium1.16.1-20260705-multi.oci.tar.gz
 
 # 在线模式（不推荐）
 ko node add 10.0.0.24 --role worker --config cluster.hcl
@@ -311,7 +334,7 @@ ko 会：
 
 ```bash
 # 离线模式（项目主用）
-ko node add 10.0.0.14 --role master --config cluster.hcl --offline --bundle ./ko-v0.0.4-multi.oci.tar.gz
+ko node add 10.0.0.14 --role master --config cluster.hcl --offline --bundle ./bundle-k8s1.32.0-cilium1.16.1-20260705-multi.oci.tar.gz
 
 # 在线模式（不推荐）
 ko node add 10.0.0.14 --role master --config cluster.hcl
@@ -336,6 +359,14 @@ ko node remove 10.0.0.24 --force --config cluster.hcl
 
 删 master 会触发 etcd 集群成员变更，**必须**保证剩余 master ≥ 3 且多数派健康。
 
+**v0.0.5 离线清理**：删节点时 `resetScript` 在 host 上额外做：
+- `sed -i '/[[:space:]]ko\.local$/d' /etc/hosts` — 剥掉 airgap 写入的 ko.local 行，防止 stale IP 解析到老 master-1
+- `rm -f /etc/containerd/config.toml` — 清 containerd mirror → ko.local:5000 的配置
+- `rm -rf /etc/systemd/system/kubelet.service.d` — 清 kubelet drop-in
+- master-1 的话还会清 in-cluster registry（`systemctl disable ko-registry` / `rm /usr/local/bin/registry` / `rm -rf /var/lib/ko-registry` 等，见 §4.3 / Task #6）
+
+下次 `ko node add` 同 host 时这些会被幂等重写，无需手工补。
+
 ### 3.4 节点打 label
 
 ```bash
@@ -343,9 +374,118 @@ ko node label 10.0.0.21 role=gpu --config cluster.hcl
 ko node label 10.0.0.21 role- --config cluster.hcl  # 删 label
 ```
 
-## 4. 主机调优
+## 4. containerd + kubelet 服务配置调优（v0.0.5）
 
-### 4.1 用 profile
+ko 在离线 init 期间会对 containerd 和 kubelet 服务做配置调优，以适应 offline airgap 场景。调优由 `OfflineRunner` 自动完成，无需手工干预。
+
+### 4.1 containerd 调优项
+
+containerd 的 config 由 `containerd.Render()` Go 模板整体生成（见 `internal/containerd/config.go`）。`OfflineRunner.configureContainerd()` 调用 `containerd.OfflineConfig()` 生成完整 config 字符串，写到 `/etc/containerd/config.toml` 并 `systemctl restart containerd`。
+
+调优项（v0.0.5 起，online + offline 都用同一套）：
+
+| 配置项 | 值 | 说明 |
+|---|---|---|
+| `max_concurrent_downloads` | 3 | 限制并发 pull，避免 offline registry 压力过大 |
+| `timeout` | 30s | pull 超时放宽（默认较短，在 slow network 下可能误报） |
+| `disable_snapshot_annotations` | false | 允许 snapshot annotations，帮助 debug / 审计 |
+| `max_container_log_line_size` | -1 | 无限制（避免 k8s 组件日志被截断） |
+| `registry.mirrors.<upstream>.endpoint` | `["http://ko.local:5000"]` | 每个 upstream registry（quay.io / registry.k8s.io / docker.io / ghcr.io）独立 mirror block，全部指向 in-cluster registry |
+| `registry.configs."ko.local:5000".tls.insecure_skip_verify` | true | 本地 registry 无 TLS |
+
+**验证**：
+
+```bash
+# 看生效的 config.toml
+containerd config dump | grep -A 2 "max_concurrent_downloads"
+# max_concurrent_downloads = 3
+
+# 看 mirror 配置
+containerd config dump | grep -A 2 "mirrors.*registry.k8s.io"
+# endpoint = ["http://ko.local:5000"]
+```
+
+### 4.2 kubelet 调优项
+
+v0.0.5 起，ko 写一个 systemd drop-in 把 `KUBELET_KUBEADM_ARGS` 覆盖掉，drop-in 落在 `/etc/systemd/system/kubelet.service.d/20-ko-offline.conf`（这是 kubeadm / systemd 推荐的位置；kubeadm init 时启 kubelet，drop-in 会被自动加载）。
+
+实现：`internal/cluster/kubelet.go` 的 `KubeletDropIn()` 渲染 drop-in 内容，`WriteKubeletDropIn()` 把内容写到 host 上（heredoc + `systemctl daemon-reload`）。`OfflineRunner.Run()` 在 step 9 写完 /etc/hosts 之后给所有 master+worker 各写一份；online init 在 `installRuntime` 循环之后也给所有 host 写一份（idempotent — online + offline 共用同一份 drop-in）。
+
+| 标志 | 值 | 说明 |
+|---|---|---|
+| `--image-pull-progress-deadline` | 30m | airgap 仓库推/拉慢，kubeadm 默认 1m 会让 cilium 这类大镜像直接 ImagePullBackOff |
+| `--registry-qps` | 5 | kubelet → registry QPS 上限（kubelet 默认就是 5，写出来便于审计） |
+| `--registry-burst` | 10 | burst 上限（同上） |
+| `--eviction-hard` | `memory.available<100Mi,nodefs.available<10%` | 磁盘满 / 内存满时驱逐 pod，而不是 CrashLoopBackOff |
+
+**为什么不用 `--kubelet-extra-args`**：那是 kubeadm init 时一次性传的 flag，不会写进任何持久文件，下次 reset 之后就没了。drop-in 由 systemd 管理，`ko reset` 的 `resetScript` 会 `rm -rf /etc/systemd/system/kubelet.service.d` 把它清掉，下次 `ko init --offline` 会重写。
+
+**验证**：
+
+```bash
+# 看 drop-in 文件
+cat /etc/systemd/system/kubelet.service.d/20-ko-offline.conf
+# [Service]
+# Environment="KUBELET_KUBEADM_ARGS=--image-pull-progress-deadline=30m --registry-qps=5 ..."
+
+# 看最终生效的 kubelet 进程参数
+ps aux | grep kubelet | grep -o 'image-pull-progress-deadline=[^ ]*'
+# image-pull-progress-deadline=30m
+
+# 看 kubeadm 写入的 flags（drop-in 是叠加的）
+cat /var/lib/kubelet/kubeadm-flags.env
+```
+
+### 4.3 registry 服务调优（systemd）
+
+registry 本身以 systemd 服务运行（`ko-registry.service`），硬化的 unit 文件包含：
+
+| 配置项 | 值 | 说明 |
+|---|---|---|
+| `User` / `Group` | 65534 (nobody) | 非 root 运行 |
+| `MemoryLimit` | 2G | 内存上限 |
+| `CPUQuota` | 200% | CPU 上限 |
+| `LimitNOFILE` | 65536 | 文件描述符 |
+| `LimitNPROC` | 4096 | 进程数 |
+| `NoNewPrivileges` | true | 安全 |
+| `ProtectSystem` | strict | 防止写 /usr /boot /etc |
+| `CapabilityBoundingSet` | `CAP_NET_BIND_SERVICE` | 最小权限 |
+
+**验证**：
+
+```bash
+systemctl cat ko-registry.service
+# 看到上面所有配置项
+
+systemctl status ko-registry.service
+# Active: active (running) since ...
+```
+
+### 4.4 手工覆盖
+
+如需调整，默认值在 `OfflineRunner` 脚本里写死。要改，有两种方式：
+
+1. **改 ko 源码**：在 `offline.go` 里调配置，重新编译。
+2. **init 后手工改**：
+   ```bash
+   # containerd
+   vim /etc/containerd/config.toml
+   systemctl restart containerd
+
+   # kubelet（drop-in 是叠加在 kubeadm-flags.env 之上的）
+   vim /etc/systemd/system/kubelet.service.d/20-ko-offline.conf
+   systemctl daemon-reload
+   systemctl restart kubelet
+
+   # registry
+   vim /etc/systemd/system/ko-registry.service
+   systemctl daemon-reload
+   systemctl restart ko-registry
+   ```
+
+> **注意**：手工改不持久（下次 ko init 会被覆盖）。如需持久化，建议提 issue 到 ko 仓库，把调优点做成 HCL config 可配置。
+
+## 4. 主机调优
 
 ```bash
 ko tune apply production --config cluster.hcl   # 默认高规格
@@ -359,7 +499,7 @@ ko tune show --config cluster.hcl
 ko tune reset --config cluster.hcl
 ```
 
-### 4.2 profile 内容
+### 4.1 profile 内容
 
 | profile     | sysctl 重点                                 | swap  | modules           |
 |-------------|---------------------------------------------|-------|-------------------|
@@ -367,7 +507,7 @@ ko tune reset --config cluster.hcl
 | dev         | 通用，宽松                                  | off   | br_netfilter      |
 | minimal     | 不动 / 关闭 swap                            | off   | 不动              |
 
-### 4.3 自定义
+### 4.2 自定义
 
 `cluster.hcl` 里 override：
 
@@ -472,7 +612,7 @@ ko cluster backup --config cluster.hcl --output ./etcd-snap-$(date +%Y%m%d).db
 ### 6.2 恢复
 
 ```bash
-# v0.0.1+：ko cluster restore 自动跑 stacked restore 全流程
+# v0.0.5+：ko cluster restore 自动跑 stacked restore 全流程
 ko cluster restore --snapshot ./ko-etcd-20260701.db --config cluster.hcl
 
 # 流程（用户看到）：
@@ -536,6 +676,16 @@ reset 是不可逆的——执行前确认 etcd 已经备份。
 
 ## 7. 常见故障
 
+### 7.0 init 报 `--offline requires --bundle`
+
+v0.0.5 起，init 启动时 upfront 校验 `--offline` 必须配 `--bundle`。报错信息：
+
+```
+--offline requires --bundle <path-to-oci-tar.gz>; see `ko pack build` to produce one
+```
+
+修法：先用 `ko pack build --arch amd64 --output ./dist` 在能上网的机器上烤 bundle，再传 bundle 到目标机器用 `ko init --offline --bundle ./bundle-*.oci.tar.gz`。如果是 `ko node add` 误加了 `--offline` 但 host 本身已经有 runtime，删掉 `--offline` 即可（online add 走 apt/dnf 路径，不需要 bundle）。
+
 ### 7.1 init 卡在 `kubeadm init`
 
 看 m1 的 `/var/log/kubelet.log` 和 `journalctl -u kubelet`。
@@ -573,7 +723,7 @@ cni { plugin = "flannel" }
 ### 7.4 离线 init 找不到镜像
 
 ```bash
-ko init --config cluster.hcl --offline --bundle ./ko-v0.0.4-multi.oci.tar.gz
+ko init --config cluster.hcl --offline --bundle ./bundle-k8s1.32.0-cilium1.16.1-20260705-multi.oci.tar.gz
 ```
 
 `--bundle` 必须是 multi-arch bundle 或与目标机器 arch 匹配的 single-arch bundle。`ko pack inspect <bundle>` 看 bundle 的 arches。
@@ -587,18 +737,18 @@ basic auth 失败。三种情况：
 
 ## 8. 升级
 
-v0.0.1 不支持集群内升级。等 v0.1.x 走 `ko upgrade` 子命令。过渡方案：
+v0.0.5 不支持集群内升级。等 v0.1.x 走 `ko upgrade` 子命令。过渡方案：
 
 ```bash
 ko reset --config cluster.hcl
-ko init --config cluster.hcl --offline --bundle ./ko-v0.0.2-multi.oci.tar.gz
+ko init --config cluster.hcl --offline --bundle ./bundle-k8s1.32.0-cilium1.16.1-20260705-multi.oci.tar.gz
 ```
 
 应用层数据如果有持久卷（PV），不会被 reset 影响。
 
 ## 9. 监控
 
-ko v0.0.1 不内置监控。建议：
+ko v0.0.5 不内置监控。建议：
 
 - Prometheus + Grafana（用 prometheus-operator chart 装）
 - node-exporter DaemonSet
@@ -694,7 +844,7 @@ GET /api/etcd/backups        # 所有备份文件列表（按 mtime desc）
 **从 snapshot restore 全集群**：
 
 ```bash
-# v0.0.1+：ko cluster restore 自动按 member 顺序 stop / move aside / restore / start
+# v0.0.5+：ko cluster restore 自动按 member 顺序 stop / move aside / restore / start
 ko cluster restore --snapshot ./ko-etcd-etcd-1-20260101-120000.db --config cluster.hcl
 
 # 流程：
@@ -733,7 +883,7 @@ sudo systemctl start etcd
 ko etcd install --regen-pki
 ```
 
-（`--regen-pki` 标志将在 v0.1.x 提供；当前 v0.0.1 重跑 `ko etcd install` 会
+（`--regen-pki` 标志将在 v0.1.x 提供；当前 v0.0.5 重跑 `ko etcd install` 会
 保留 CA 仅刷新 server/peer/client，幂等。）
 
 ### 10.6 故障排查

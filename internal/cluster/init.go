@@ -44,7 +44,7 @@ func NewInitFromConfig(cfg *config.File, exec Executor) (*Init, error) {
 	cacheDir := filepath.Join(cacheHome(), "containerd")
 
 	ctdInstaller := containerd.NewInstaller(exec, cfg.Containerd.Version, cfg.Containerd.Source, arch, cacheDir)
-	dckInstaller := docker.NewInstaller(exec, "27.5.1", "stable")
+	dckInstaller := docker.NewInstaller(exec, "", "stable")
 	kb := NewKubeadm(exec)
 	return &Init{
 		Cfg:           cfg,
@@ -132,6 +132,13 @@ func (i *Init) Run(ctx context.Context, masterHost string) error {
 				return fmt.Errorf("install runtime on %s: %w", h, err)
 			}
 		}
+		// kubelet drop-in: harmless online, essential offline. Even in
+		// online mode, the eviction thresholds + image-pull deadline
+		// are reasonable production defaults; the offline runner writes
+		// the same drop-in again (idempotent — just rewrites the file).
+		if err := writeKubeletDropInAll(ctx, i.Exec, hosts); err != nil {
+			return err
+		}
 	}
 	// In offline mode, OfflineRunner has already installed kubeadm to
 	// /usr/local/bin on master-1. bootstrapKubeadm is a no-op (idempotent
@@ -212,7 +219,7 @@ func (i *Init) installRuntime(ctx context.Context, host string) error {
 	switch runtime {
 	case "containerd":
 		cfg := containerd.DefaultConfig(
-			i.Cfg.Image.RegistryMirrors,
+			containerd.MirrorsFromDockerEndpointURLs(i.Cfg.Image.RegistryMirrors),
 			i.Cfg.Image.InsecureRegistries,
 		)
 		return i.ContainerdCtl.Install(ctx, host, cfg)

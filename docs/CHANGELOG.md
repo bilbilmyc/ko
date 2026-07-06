@@ -5,15 +5,73 @@ ko 的所有重要变更都会记在这里。格式基于 [Keep a Changelog](htt
 
 ## [Unreleased]
 
-### Fixed — 修正 v0.0.3 / v0.0.4 的 bundle dedup 描述（backport 到上面的 entry）
+### Added — `ko init --offline` 强制 `--bundle` 校验（v0.0.5）
 
-实测 v0.0.2 / v0.0.3 / v0.0.4 三个 release 的 amd64 bundle 体积都是 ~826M（差异 < 10KB 是 round-trip 噪声）。原因是当前 GitHub Actions runner 用 docker vfs storage driver，自己已经按内容 dedup 了，`dedupDockerArchive` 在这套 storage driver 上没有 duplicate payload 可去。
+- **拒绝 silent footgun**：`--offline`（local 或 global）没配 `--bundle` 直接 init，错误信息从 `bundle is required`（中期，confusing）改成 upfront `--offline requires --bundle <path-to-oci-tar.gz>; see ko pack build to produce one`
+- **覆盖所有 offline flag 路径**：local `--offline` / global `--offline` / 两者都给 — 任一未配 bundle 都 fail
+- **测试**：`TestInit_RejectsOfflineWithoutBundle` 6 个子用例（3 个 fail + 3 个 ok）
 
-之前 CHANGELOG / README / PLAN / RUNBOOK 里写的 "826M → ~280M" 是基于 arm64 本地烤包体积的误解：~280M 是 **arm64 image** 真实 unique content 体积，不是 dedup 效果。amd64 image 真实 unique content 就是 ~826M。
+### Added — `ko reset` 离线清理补全（v0.0.5）
 
-为什么 v0.0.3 / v0.0.4 仍然保留：换 storage driver / runner / nerdctl 版本时 dedup 是兜底防线。功能正确，单元测试覆盖（合成 docker-archive + 真 docker save + 拒绝非 docker-archive 三种场景）。
+- **in-cluster registry 清理**：`resetScript` 加 5 行清理 master-1 的 v0.0.5 in-cluster registry — `systemctl disable --now ko-registry.service` / `rm -f /etc/systemd/system/ko-registry.service` / `rm -rf /var/lib/ko-registry` / `rm -f /usr/local/bin/registry` / `rm -f /etc/registry-config.yml`
+- **no-op on 非 master-1**：所有行带 `|| true`，非 master host 没这些文件/unit 时不 fail
+- **测试**：`TestResetScript_Default_HasCoreCleanup` 加 5 行新断言
 
-本版本无代码改动，仅文档修正（不上 tag）。
+### Added — `ko node remove` 离线清理（v0.0.5）
+
+- **`/etc/hosts` ko.local 行 strip**：`resetScript` 加 `sed -i '/[[:space:]]ko\.local$/d' /etc/hosts 2>/dev/null || true` — 防止 reset 后 stale IP 解析到老 master-1，`ko node add` 再写回幂等
+- **containerd mirror config**：通过现有的 `rm -f /etc/containerd/config.toml` 已经清(同 §4.1) — 不重复加
+- **kubelet drop-in**：通过现有的 `rm -rf /etc/systemd/system/kubelet.service.d` 已经清 — 不重复加
+- **测试**：`TestResetScript_Default_HasCoreCleanup` 加 `sed -i ... ko\.local` 断言
+
+### Added — containerd + docker 默认拉 latest stable（用户 2026-07-06 决策）
+
+- **containerd 最新**：pack 阶段通过 GitHub API `repos/containerd/containerd/releases/latest` 拿 tag（cache 24h），embed 进 bundle；之前写死 `v2.0.5`，现在自动追踪 upstream stable
+- **docker 最新**：`internal/docker/defaultVersion` 改为空字符串，让 `apt install docker-ce` 装 channel 最新；不再写死 `27.5.1`。HCL 仍可显式 pin
+- **fallback**：GitHub API 不可达时 containerd 退到 `v2.1.0`，而不是 fail 整个 pack
+- **新增 `LatestContainerdVersion` / `LatestDockerVersion`**：`UpstreamDownloader` 上的 helper，pack 调用
+- **新增 `latestGitHubTag`**：通用 helper，缓存文件 `~/.ko/cache/{containerd,docker}-latest.txt`，24h TTL
+- **新增测试**：`TestLatestContainerdVersion_CacheHit` / `TestLatestDockerVersion_CacheHit` / `TestLatestContainerdVersion_HitsGitHub` / `TestLatestDockerVersion_HitsGitHub`
+
+### Added — bundle push 后清临时文件 + ctr cache 节省空间（用户 2026-07-06 决策）
+
+- **删 ctr cache**：`pushImages` 完成后给每个 push 过的 image `ctr images unset` + `ctr images rm`（source tag + target tag），registry 已有 manifest/blob，本地 cache 是纯复制
+- **删 /tmp tarball**：`rm -f /tmp/ko-bundle.oci.tar.gz`（826M 临时文件，host extract 完成后没用）
+- **保留**：`/var/lib/ko/bundle/` 完整目录保留（reset --purge 才删）/ `/usr/local/bin/registry` 静态二进制 / systemd unit 都保留
+- **测试更新**：`TestOfflineRunner_PushImages_AllImagesRetaggedAndPushed` 加 cleanup 断言（每个 k8s / cilium image 都要 unset + rm + tarball rm）
+
+### Added — kubelet systemd drop-in 离线调优（v0.0.5）
+
+- **kubelet drop-in**：写 `/etc/systemd/system/kubelet.service.d/20-ko-offline.conf` 把 `KUBELET_KUBEADM_ARGS` 覆盖为 `--image-pull-progress-deadline=30m --registry-qps=5 --registry-burst=10 --eviction-hard=memory.available<100Mi,nodefs.available<10%`
+- **airgap 关键**：`--image-pull-progress-deadline` 默认 1m，cilium 这类 ~200M 镜像会 ImagePullBackOff；30m 让 airgap 能跑通
+- **生产兜底**：eviction 阈值防止磁盘满时整个节点 CrashLoopBackOff
+- **online + offline 共用**：drop-in 内容一致，online init 也在 `installRuntime` 之后给所有 host 写一份
+- **`OfflineRunner.Run`** 第 9 步：写完 `/etc/hosts` 之后给所有 master + worker 各应用 drop-in
+- **teardown**：`ko reset` 的 `resetScript` 已经清理 `/etc/systemd/system/kubelet.service.d`，下次 init 会重写
+- **实现**：新 `internal/cluster/kubelet.go` — `KubeletDropIn()` 渲染内容、`WriteKubeletDropIn(ctx, exec, host)` 写到 host
+- **测试**：`TestKubeletDropIn_ContainsRequiredFlags` / `TestWriteKubeletDropIn_WritesExpectedFile` / `TestWriteKubeletDropIn_PropagatesFailure` / `TestWriteKubeletDropInAll_StopsOnFirstFailure` / `TestKubeletDropIn_HeredocSafeQuotes`
+- **docs**：RUNBOOK §4.2 重写（之前声称 `--kubelet-extra-args`，是错的，根本没传；drop-in 才是真实现）
+
+### Added — registry 改二进制运行 + systemd 硬化 + containerd/kubelet 服务配置调优（S17 v0.0.5）
+
+- **registry 改二进制运行**：bundle 烤 `registry` Go 二进制（`distribution/distribution` v2.8.3）而非 `registry:2` 容器镜像；offline init 提取到 `/usr/local/bin/registry`，以 systemd 服务 `ko-registry.service` 运行（不再是 `nerdctl run` 容器）
+- **systemd 硬化**：`ko-registry.service` 配置 `User=65534` (nobody)、`MemoryLimit=2G`、`CPUQuota=200%`、`NoNewPrivileges=true`、`ProtectSystem=strict`、`CapabilityBoundingSet=CAP_NET_BIND_SERVICE`、`SystemCallFilter` 等沙盒（见 `internal/cluster/offline.go`）
+- **registry 配置**：`/etc/registry-config.yml`，监听 `:5000`（主服务）+ `:5001`（debug/prometheus），blob 存 `/var/lib/ko-registry`，`health.storagedriver` 间隔 10s
+- **containerd 配置调优**：`configureContainerd()` 写 `max_concurrent_downloads=3`、`timeout=30s`、`disable_snapshot_annotations=false`、所有 upstream registry 的 mirror endpoint 指向 `http://ko.local:5000`
+- **installRuntimeFromBundle 调优**：离线 init 时 containerd 解包后立即配置 tune（`disable_snapshot_annotations`、`max_container_log_line_size`），再 `systemctl enable --now containerd`
+- **pushImages 并发 + 重试**：retag + push 改为后台并发 (`&`)，每个 push 带 3 次重试 + 2s 间隔
+- **docs 更新**：RUNBOOK §1.6 更新 offline init 流程描述（registry 改 systemd）；新增 §4 专门说明 containerd + kubelet + registry 服务配置调优
+- **测试覆盖**：新增 `TestOfflineRunner_StartRegistry_WritesHardenedSystemdUnit`（systemd 硬化断言）、扩展 `TestOfflineRunner_ConfigureContainerd_GeneratesExpectedMirrors`（v0.0.5 调优断言）、新增 `TestExtractSingleBinary_FindsRegistryEntry` / `TestRegistryBinary_CachedSkip` / `TestRegistryBinary_StripsVPrefix` / `TestRegistryBinary_RejectsMissingEntry` / `TestDefaultRegistryVersion_PinGuard`（registry 二进制下载 + 缓存）；`buildMinimalBundleForTest` 改为含 `MediaTypeKoRegistryBinary` 层；现有 `TestOfflineRunner_PushImages_AllImagesRetaggedAndPushed` 断言更新以匹配 `push_with_retry` + 并发骨架
+
+### Changed — containerd 配置改 Go 模板（v0.0.5 重构）
+
+- **镜像配置修正**：`ConfigToml.RegistryMirrors` 从 `[]string` 改为 `[]Mirror{Upstream, Endpoint}`（修复旧模板 `endpoint = ["{{.}}"]` 的 no-op bug — mirror name 和 endpoint 现在正确区分）
+- **离线配置工厂**：新增 `containerd.OfflineConfig(upstreams, insecure, mirrorEndpoint)` — 给定 upstream 列表（如 quay.io / registry.k8s.io / docker.io / ghcr.io）和本地 registry endpoint，生成完整的 `config.toml` 字符串（含每个 upstream 一个 mirror block，全部指向 in-cluster registry）
+- **在线配置适配**：新增 `containerd.MirrorsFromDockerEndpointURLs(endpoints)` — 把 HCL `registry_mirrors = ["https://…"]` 这种 flat endpoint 列表转换为 `[]Mirror`，Upstream 默认 "docker.io"（保留向后兼容）
+- **containerd 配置调优移入模板**：`max_concurrent_downloads=3`、`timeout="30s"`、`disable_snapshot_annotations=false`、`max_container_log_line_size=-1` 改为在 `internal/containerd/config.go` 的 Go 模板里渲染，不再用 bash sed 注入
+- **在线/离线配置统一**：online init 也走这套调优（不再 online 零调优）
+- **bash sed 去除**：`OfflineRunner.configureContainerd` 和 `installRuntimeFromBundle` 不再用 sed/grep 注入配置；改为单次 `cat > /etc/containerd/config.toml <<EOF … EOF` 原子写入
+- **测试更新**：新增 `TestDefaultConfig_OfflineTuning` / `TestDefaultConfig_TuningOverrides` / `TestOfflineConfig_GeneratesOneMirrorPerUpstream` / `TestOfflineConfig_MarksLocalRegistryInsecure` / `TestMirrorsFromDockerEndpointURLs`；更新 `TestDefaultConfig` 改用 `[]Mirror`
 
 ## [v0.0.4] — 2026-07-02
 
