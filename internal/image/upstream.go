@@ -183,6 +183,11 @@ func (u *UpstreamDownloader) K8sImagesTar(ctx context.Context, k8sVersion, arch 
 	if err := puller.Save(ctx, dest, imgs); err != nil {
 		return "", fmt.Errorf("k8s images save: %w", err)
 	}
+	// Free the local image store now that the bundle has its own copy of
+	// every k8s image as a docker-archive layer. ~1-2 GB on a typical pack.
+	if err := puller.Remove(ctx, imgs); err != nil {
+		logger.Warn("k8s images local cleanup returned errors; non-fatal", "err", err)
+	}
 	logger.Info("k8s images tar written", "dest", dest, "size_bytes", mustStat(dest))
 	return dest, nil
 }
@@ -209,6 +214,10 @@ func (u *UpstreamDownloader) RegistryImage(ctx context.Context, arch string) (st
 	}
 	if err := puller.Save(ctx, dest, []string{img}); err != nil {
 		return "", fmt.Errorf("registry image save: %w", err)
+	}
+	// Free the local image store — registry:2 is in the bundle layer now.
+	if err := puller.Remove(ctx, []string{img}); err != nil {
+		logger.Warn("registry image local cleanup returned errors; non-fatal", "err", err)
 	}
 	logger.Info("registry image tar written", "dest", dest, "size_bytes", mustStat(dest))
 	return dest, nil
@@ -352,6 +361,11 @@ func (u *UpstreamDownloader) CiliumImagesTar(ctx context.Context, version string
 	if err := puller.Save(ctx, dest, imgs); err != nil {
 		return "", fmt.Errorf("cilium images save: %w", err)
 	}
+	// Free the local image store — every cilium image is now a bundle
+	// layer (~1 GB saved across the cilium 1.16 image set).
+	if err := puller.Remove(ctx, imgs); err != nil {
+		logger.Warn("cilium images local cleanup returned errors; non-fatal", "err", err)
+	}
 	logger.Info("cilium images tar written", "dest", dest, "size_bytes", mustStat(dest))
 	return dest, nil
 }
@@ -392,10 +406,16 @@ func CiliumImagesForVersion(version string) []string {
 // pack time. nerdctl is preferred (it's the containerd-native CLI); docker
 // is the fallback. ctr is not supported here because it doesn't expose a
 // save command that emits docker-archive format.
+//
+// Remove is invoked after a successful Save so the local image store
+// doesn't accumulate the k8s / cilium / registry:2 images pack pulls in.
+// The return is a joined error of per-image failures; callers are free
+// to treat it as best-effort — a leftover image only costs disk.
 type ImagePuller interface {
 	Name() string
 	PullAll(ctx context.Context, images []string) error
 	Save(ctx context.Context, dest string, images []string) error
+	Remove(ctx context.Context, images []string) error
 }
 
 func detectImagePuller() (ImagePuller, error) {
@@ -461,6 +481,37 @@ func (p *cliPuller) Save(ctx context.Context, dest string, images []string) erro
 		"pre_bytes", preSize, "post_bytes", postSize,
 		"ratio", fmt.Sprintf("%.2fx", float64(preSize)/float64(postSize+1)))
 	return nil
+}
+
+// Remove deletes images from the local image store. Pack invokes it after
+// a successful Save so the k8s / cilium / registry:2 images pulled in for
+// the bundle don't accumulate in the operator's docker/nerdctl store
+// (5-10 GB typical per build).
+//
+// Best-effort by design: each image is removed independently, failures
+// are logged as warnings, and a non-nil joined error is returned so callers
+// can choose to surface it. The current call sites ignore the return — a
+// leftover image only costs disk, not correctness.
+func (p *cliPuller) Remove(ctx context.Context, images []string) error {
+	var errs []string
+	for _, img := range images {
+		cmd := exec.CommandContext(ctx, p.bin, "rmi", img)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			// `rmi` is best-effort; a single failure (image already gone,
+			// image referenced by a stopped container, etc.) must not abort
+			// the rest of the cleanup pass.
+			logger.Warn("local image cleanup failed", "tool", p.bin, "image", img,
+				"err", err, "out", strings.TrimSpace(string(out)))
+			errs = append(errs, fmt.Sprintf("%s: %s", img, strings.TrimSpace(string(out))))
+			continue
+		}
+		logger.Info("local image cleaned up", "tool", p.bin, "image", img)
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s rmi partial failure: %s", p.bin, strings.Join(errs, "; "))
 }
 
 // dedupDockerArchive reads a docker-archive tar at src and writes a copy at

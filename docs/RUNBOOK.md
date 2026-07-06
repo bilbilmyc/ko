@@ -68,6 +68,8 @@ ko pack build --arch amd64 --output ./dist --version bundle-k8s1.32.0-cilium1.16
 
 烤好的 bundle 推到**公司内部存储**（HTTP / NFS / MinIO 等 — 待选型，见 PLAN §8.6），交付时与 ko 二进制一起给到目标机器。详细流程见 §2.8 交付物。
 
+**v0.0.5+ pack 完本机镜像自动清理**：bundle 烤完后 `ImagePuller.Remove` 会把本机 docker/nerdctl 镜像存储里临时拉入的 k8s / cilium / `registry:2` 镜像 `rmi` 掉（best-effort，单张失败 `logger.Warn` 后继续），单次 pack 大约释放 5-10 GB。**`~/.ko/cache/<sha>.tar` 不动**（那是 bundle 层的真实输入，下次 pack 复用）。
+
 ### 1.3 cluster.hcl 配置
 
 ```bash

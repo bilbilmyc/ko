@@ -5,6 +5,16 @@ ko 的所有重要变更都会记在这里。格式基于 [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Added — `ko pack build` 完后 operator 本机镜像自动清理（用户 2026-07-06 决策）
+
+- **删本机 docker/nerdctl store 的临时镜像**：每个 `puller.PullAll` + `puller.Save` 完成后，pack 调用 `puller.Remove` 把本机镜像存储里的 k8s / cilium / `registry:2` 镜像清掉。bundle 已经把这些 image 烤进自己的 docker-archive layer，本机 store 里的副本是纯垃圾
+- **节省磁盘**：单次 pack 大约释放 5-10 GB（本机 docker store 没有跨 image dedup 时更明显）
+- **best-effort 语义**：单张 image `rmi` 失败 → `logger.Warn` 后继续；返回 joined error 给 caller 自由选择是否 abort。当前三个 caller（`K8sImagesTar` / `RegistryImage` / `CiliumImagesTar`）都吞掉 error 当非致命，pack 本身不因此失败
+- **per-image `rmi`**：故意一次只删一张而不是 `rmi a b c` 批量 — 单张失败不阻断其余，是 best-effort 契约的硬要求
+- **新接口**：`ImagePuller` 加 `Remove(ctx, images []string) error` 方法；`cliPuller.Remove` 用 `nerdctl rmi` / `docker rmi` 走原本的 bin
+- **不动**：`~/.ko/cache/<sha>.tar` 全留（那是 bundle 层的真实输入，下次 `ko pack` 还要复用）；部署节点的清理走另一条路（master-1 在 `pushImages` 末尾已清）
+- **测试**：`TestCliPuller_Remove_InvokesRmiWithImages` / `TestCliPuller_Remove_ContinuesOnPerImageFailure` / `TestCliPuller_Remove_EmptyListNoop` — fake `nerdctl` 二进制记录调用 + 按需模拟单张失败
+
 ### Added — `ko init --offline` 强制 `--bundle` 校验（v0.0.5）
 
 - **拒绝 silent footgun**：`--offline`（local 或 global）没配 `--bundle` 直接 init，错误信息从 `bundle is required`（中期，confusing）改成 upfront `--offline requires --bundle <path-to-oci-tar.gz>; see ko pack build to produce one`

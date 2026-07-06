@@ -386,6 +386,7 @@ S15 / S16 不在 SPEC §8 范围内（v0.0.1 → v0.1.x 过渡补强），已合
 | `WIP` | v0.0.5 containerd 默认拉 GitHub latest stable（cache 24h），docker CE 改为 channel latest，不再写死版本号（用户 2026-07-06 决策） |
 | `WIP` | v0.0.5 `ko node remove` / `ko reset` 离线清理补全：`/etc/hosts` ko.local 行 strip + registry service/binary/data/config 清理 |
 | `WIP` | v0.0.5 `--offline` 强制 `--bundle` 校验：init 启动时 upfront 拒绝 silent footgun |
+| `WIP` | v0.0.5 `ko pack build` 完后 operator 本机 docker/nerdctl 镜像存储自动清理（`ImagePuller.Remove`，`nerdctl rmi` / `docker rmi` 逐张删，best-effort）— 用户 2026-07-06 决策（节省 5-10 GB 本机磁盘） |
 
 **v0.0.1 已发布** — tag 指向 `500731e`，release 产物：`ko-linux-amd64` / `ko-linux-arm64` / `ko-v0.0.1-multi.oci.tar.gz`（**注意**：v0.0.1 的 bundle 只含 containerd，真离线能力随 S17 发布）
 

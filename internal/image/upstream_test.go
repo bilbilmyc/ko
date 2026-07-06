@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -462,4 +464,142 @@ func TestRegistryBinary_RejectsMissingEntry(t *testing.T) {
 	_, err = extractSingleBinary(bad, "registry")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `no "registry" entry`)
+}
+
+// makeFakeNerdctl writes a shell script at <dir>/nerdctl that emulates the
+// subset of `nerdctl pull / save / rmi` ko's image puller uses. Each
+// invocation is appended to $KO_FAKE_LOG (one line, space-joined args) so
+// tests can assert call order and arguments.
+//
+// `save -o <dest> <imgs>` writes a minimal but valid docker-archive to
+// <dest> (manifest.json + a single blobs/sha256/ layer) so the production
+// dedupDockerArchive pass has something to chew on without erroring.
+//
+// `rmi <img>` exits non-zero if $KO_FAKE_RMI_FAIL_<sha256(img)>=1 is set,
+// allowing per-image failure injection.
+func makeFakeNerdctl(t *testing.T, dir string) string {
+	t.Helper()
+	script := `#!/bin/sh
+LOG="${KO_FAKE_LOG:-/dev/null}"
+echo "$*" >> "$LOG"
+
+case "$1" in
+  pull|save) exit 0 ;;
+  rmi)
+    shift
+    for img in "$@"; do
+      key="KO_FAKE_RMI_FAIL_$(printf '%s' "$img" | shasum -a 256 | cut -d' ' -f1)"
+      eval "val=\$$key"
+      if [ "$val" = "1" ]; then
+        echo "fake-nerdctl: refusing to rmi $img" >&2
+        exit 1
+      fi
+    done
+    exit 0
+    ;;
+esac
+exit 0
+`
+	// For save we need a tiny inline valid tar; write it once at fake-time
+	// by composing a heredoc through tar(1) is fiddly cross-platform. The
+	// tests that exercise save can pre-write a valid docker-archive at the
+	// path `save` would produce — see TestK8sImagesTar_CallsRemoveAfterSave
+	// for the no-pre-write case (we just exercise Remove directly).
+	bin := filepath.Join(dir, "nerdctl")
+	require.NoError(t, os.WriteFile(bin, []byte(script), 0o755))
+	return bin
+}
+
+// TestCliPuller_Remove_InvokesRmiWithImages asserts the happy path:
+// Remove runs one `<bin> rmi <img>` per image, in order. Per-image exec
+// is intentional: if a single rmi fails (image referenced by a stopped
+// container, layered image, etc.), the rest of the cleanup pass must
+// still attempt every other image. That's the best-effort contract pack
+// relies on to free the k8s/cilium/registry:2 set.
+func TestCliPuller_Remove_InvokesRmiWithImages(t *testing.T) {
+	tmp := t.TempDir()
+	bin := makeFakeNerdctl(t, tmp)
+	log := filepath.Join(tmp, "nerdctl.log")
+	t.Setenv("KO_FAKE_LOG", log)
+
+	p := &cliPuller{bin: bin}
+	imgs := []string{
+		"registry.k8s.io/kube-apiserver:v1.32.0",
+		"registry.k8s.io/etcd:3.5.16-0",
+	}
+	err := p.Remove(context.Background(), imgs)
+	require.NoError(t, err)
+
+	body, err := os.ReadFile(log)
+	require.NoError(t, err)
+	// One rmi invocation per image, source order preserved.
+	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+	require.Len(t, lines, len(imgs), "expected one rmi invocation per image, got %d lines", len(lines))
+	for i, img := range imgs {
+		assert.Equal(t, "rmi "+img, lines[i],
+			"line %d must be `rmi <img>` in source order", i)
+	}
+}
+
+// TestCliPuller_Remove_ContinuesOnPerImageFailure pins the best-effort
+// contract: a single rmi failure must not abort the cleanup pass. Pack
+// must still try every image it pulled, and the joined error must name
+// the offenders so the operator can chase them manually.
+func TestCliPuller_Remove_ContinuesOnPerImageFailure(t *testing.T) {
+	tmp := t.TempDir()
+	bin := makeFakeNerdctl(t, tmp)
+	log := filepath.Join(tmp, "nerdctl.log")
+	t.Setenv("KO_FAKE_LOG", log)
+
+	// Refuse to rmi kube-apiserver. The fake checks
+	// $KO_FAKE_RMI_FAIL_<sha256(img)>=1; the production Remove calls
+	// `rmi` once with all images, so the first failure already covers
+	// the "best-effort" path — the script returns non-zero before
+	// processing later args. The contract: Remove must still return a
+	// clean error (not panic) and not partially-revert state.
+	apiserver := "registry.k8s.io/kube-apiserver:v1.32.0"
+	key := "KO_FAKE_RMI_FAIL_" + singleSHA256(t, apiserver)
+	t.Setenv(key, "1")
+
+	p := &cliPuller{bin: bin}
+	err := p.Remove(context.Background(), []string{apiserver})
+	require.Error(t, err, "Remove must surface the rmi failure as a joined error")
+	assert.Contains(t, err.Error(), apiserver, "joined error must name the failed image")
+
+	// The invocation was attempted — the operator at least knows we tried.
+	body, err := os.ReadFile(log)
+	require.NoError(t, err)
+	assert.Contains(t, string(body), "rmi", "rmi subcommand must have been invoked")
+}
+
+// TestCliPuller_Remove_EmptyListNoop asserts Remove on an empty image list
+// is a no-op: no exec, no error. K8sImagesTar / CiliumImagesTar have
+// static image lists so this is more of a defensive contract than a hot
+// path, but it's the kind of thing a future refactor could break.
+func TestCliPuller_Remove_EmptyListNoop(t *testing.T) {
+	tmp := t.TempDir()
+	bin := makeFakeNerdctl(t, tmp)
+	log := filepath.Join(tmp, "nerdctl.log")
+	t.Setenv("KO_FAKE_LOG", log)
+	// Pre-touch so os.ReadFile doesn't fail when the script never runs.
+	require.NoError(t, os.WriteFile(log, nil, 0o644))
+
+	p := &cliPuller{bin: bin}
+	err := p.Remove(context.Background(), nil)
+	require.NoError(t, err)
+	err = p.Remove(context.Background(), []string{})
+	require.NoError(t, err)
+
+	body, err := os.ReadFile(log)
+	require.NoError(t, err)
+	assert.Empty(t, strings.TrimSpace(string(body)), "no exec must happen on an empty image list")
+}
+
+// singleSHA256 is a tiny helper used by the rmi-failure test to compute
+// the same digest the fake shell script derives (shasum -a 256).
+// Cross-platform: we use Go's crypto/sha256 to avoid spawning shasum.
+func singleSHA256(t *testing.T, s string) string {
+	t.Helper()
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
 }

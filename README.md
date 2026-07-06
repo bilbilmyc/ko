@@ -103,6 +103,10 @@ ko pack build --arch all --output ./dist --version bundle-k8s1.32.0-cilium1.16.1
 
 # 2. 推到公司内部 NFS（运维挂载路径）
 scp dist/bundle-k8s1.32.0-cilium1.16.1-20260702-multi.oci.tar.gz ko-nfs:/mnt/ko-store/
+
+# v0.0.5+：pack 完后本机 docker/nerdctl 中临时拉入的 k8s/cilium/registry:2
+# 镜像会自动 rmi（best-effort），本机磁盘释放 5-10 GB；bundle 自身和
+# ~/.ko/cache/<sha>.tar 不动。
 ```
 
 ### 在线安装（备选 / 不推荐，仅供测试）
